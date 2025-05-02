@@ -1,0 +1,33 @@
+0.001998 - experiment_10.docx - 963
+0.001999 - experiment_13.docx - 963
+0.002498 - experiment_16.docx - 1000
+0.002500 - experiment_17.docx - 975
+0.002496 - experiment_19.docx - 975
+
+
+Processing Details:
+-------------------
+Processing Time (s): 25.92
+Hops Taken: 10
+
+Queries Used:
+-------------
+1. For experiments conducted at temperatures above 800°C, was there a consistent trend observed between the catalyst thickness and the final height achieved? Describe the findings based on the available data.
+2. "High-temperature CVD growth (>800°C) of CNTs: correlation between catalyst film thickness and nanotube length, experimental data analysis"
+3. "Influence of catalyst layer thickness on CNT height at temperatures exceeding 800°C; Raman spectroscopy, SEM, TEM characterization of CNTs synthesized via CVD"
+4. Correlation between catalyst thickness and final CNT height in experiments above 800°C; statistical analysis of experimental data
+5. Statistical analysis of the relationship between catalyst thickness and final CNT height for experiments with temperatures above 800°C
+6. Experimental data showing the relationship between catalyst thickness and final CNT height for experiments conducted at temperatures above 800°C
+7. Experimental data on CNT growth at temperatures above 800°C showing the relationship between catalyst thickness (in µm) and final CNT height (in µm)
+8. CNT growth experiments above 800°C: correlation between catalyst thickness (µm) and final CNT height (µm); data table or graph
+9. Experimental data table or graph showing the relationship between catalyst thickness (µm) and final CNT height (µm) for experiments conducted at temperatures above 800°C
+10. Table or graph showing catalyst thickness (µm) vs. final CNT height (µm) for experiments above 800°C
+11. Table or graph showing catalyst thickness (µm) vs. final CNT height (µm) for experiments with temperatures > 800°C
+
+Additional Information:
+-----------------------
+Final Context Length: 108095
+Vector DB Type: In-Memory
+Cache Hits (Embedding): 0
+Cache Hits (LLM): 0
+Graph Filename: cnt_rag_graphs_test/rag_hop_graph_2757499a.png

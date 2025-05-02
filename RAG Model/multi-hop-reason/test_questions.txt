@@ -1,0 +1,5 @@
+What was the final height achieved in the experiment with temperature 963?
+Compare the highest growth rate for experiments run at temperatures above 900.
+Which temperature is better for achieving the highest growth rate for CNT?
+Among the experiments with catalyst thickness between 1.4 and 1.5, which Input Conditions achieved the maximum Final height?
+For experiments conducted at temperatures above 800°C, was there a consistent trend observed between the catalyst thickness and the final height achieved? Describe the findings based on the available data.
