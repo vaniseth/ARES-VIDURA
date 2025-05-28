@@ -26,17 +26,17 @@ def load_test_questions(filepath: str) -> List[str]:
 
 def run_test_query(rag_system: CNTRagSystem, question: str, index: int):
     """Runs a single test query and prints the results."""
-    print(f"\n--- Processing Query {index+1} ---")
+    print(f"\n--- Processing Query {index+1} for '{rag_system.user_type}' user ---") # Added user type to print
     print(f"Question: {question}")
 
     start_time = time.time()
     results = rag_system.process_query(
         question=question,
-        top_k=config.DEFAULT_TOP_K,             # Use defaults from config
-        max_hops=config.DEFAULT_MAX_HOPS,       # Use defaults from config
-        use_query_expansion=True,               # Example: enable expansion
-        request_evaluation=True,                # Example: enable evaluation
-        generate_graph=True                     # Example: enable graph generation
+        top_k=config.DEFAULT_TOP_K,            
+        max_hops=config.DEFAULT_MAX_HOPS,      
+        use_query_expansion=True,              
+        request_evaluation=True,               
+        generate_graph=True                    
     )
     end_time = time.time()
 
@@ -46,12 +46,6 @@ def run_test_query(rag_system: CNTRagSystem, question: str, index: int):
     confidence = results.get("confidence_score")
     print("\n--- Confidence Score ---")
     print(f"{confidence:.2f}" if confidence is not None else "N/A")
-
-    # print("\n--- Evaluation Metrics ---")
-    # print(results.get("evaluation_metrics", "N/A"))
-
-    # print("\n--- Formatted Reasoning Trace ---")
-    # print(results.get("formatted_reasoning", "N/A"))
 
     print("\n--- Debug Info ---")
     debug_info = results.get("debug_info", {})
@@ -70,6 +64,16 @@ if __name__ == "__main__":
     logger = setup_logging(config.DEFAULT_LOG_LEVEL, config.DEFAULT_LOG_FILE_PATH)
     logger.info("--- Starting CNT RAG Application ---")
 
+    # --- Determine User Type (Example: via input) ---
+    user_type_input_str = 'advanced' #input("Enter user type ('novice' or 'advanced', press Enter for 'novice'): ").strip().lower()
+    if not user_type_input_str:
+        user_type_input_str = "advanced"
+    elif user_type_input_str not in ["novice", "advanced"]:
+        logger.warning(f"Invalid user type '{user_type_input_str}' entered. Defaulting to 'novice'.")
+        user_type_input_str = "advanced"
+    logger.info(f"Selected user type: {user_type_input_str}")
+
+
     # --- Initialize Components ---
     try:
         llm_interface = LLMInterface(
@@ -84,23 +88,21 @@ if __name__ == "__main__":
 
         vector_store = get_vector_store(
             vector_db_type=config.DEFAULT_VECTOR_DB_TYPE,
-            vector_db_path=config.DEFAULT_VECTOR_DB_PATH, # Path used for CSV, or persist dir for Chroma, or cache load/save for InMemory
+            vector_db_path=config.DEFAULT_VECTOR_DB_PATH, 
             logger=logger
         )
 
-        # Define chunk settings dictionary
         chunk_settings = {
             'strategy': config.DEFAULT_CHUNK_STRATEGY,
             'size': config.DEFAULT_CHUNK_SIZE,
             'overlap': config.DEFAULT_CHUNK_OVERLAP,
         }
 
-        # Load or build the vector store *before* initializing RAG system
         logger.info("Loading or building vector store...")
         build_success = vector_store.load_or_build(
             documents_path_pattern=config.DEFAULT_DOCUMENTS_PATH_PATTERN,
             chunk_settings=chunk_settings,
-            embedding_interface=llm_interface # Pass LLM interface for embedding during build
+            embedding_interface=llm_interface 
         )
 
         if not build_success or not vector_store.is_ready():
@@ -108,31 +110,28 @@ if __name__ == "__main__":
              exit(1)
         logger.info("Vector store ready.")
 
-        # Load feedback history
         feedback_history = load_feedback_history(config.DEFAULT_FEEDBACK_DB_PATH, logger)
 
-        # Initialize the main RAG system
         cnt_rag_system = CNTRagSystem(
             llm_interface=llm_interface,
             vector_store=vector_store,
             logger=logger,
             feedback_db_path=config.DEFAULT_FEEDBACK_DB_PATH,
-            feedback_history=feedback_history, # Pass the loaded list
+            feedback_history=feedback_history, 
+            user_type=user_type_input_str, # Pass the user type here
             graph_dir=config.DEFAULT_GRAPH_DIR,
             max_context_tokens=config.MAX_CONTEXT_TOKENS,
             char_to_token_ratio=config.CHAR_TO_TOKEN_RATIO,
             similarity_threshold=config.SIMILARITY_THRESHOLD
         )
-        logger.info("CNTRagSystem Initialized.")
+        logger.info(f"CNTRagSystem Initialized for '{cnt_rag_system.user_type}' user.")
 
     except Exception as e:
         logger.exception(f"Fatal error during RAG system initialization: {e}")
         exit(1)
 
-    # --- Load Test Questions ---
     test_questions = load_test_questions(config.DEFAULT_TEST_QUESTIONS_PATH)
 
-    # --- Run Test Queries ---
     if not test_questions:
         logger.warning("No test questions loaded. Exiting.")
     else:

@@ -63,3 +63,5 @@ ehthumbs.db
 *.~*
 *.orig
 api.txt
+RAG Model/multi-hop-reason/cnt_rag_graphs/*
+*.zip
