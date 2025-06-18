@@ -1,4 +1,3 @@
-# rag_core.py
 import logging
 import time
 import re
@@ -9,7 +8,7 @@ from difflib import SequenceMatcher
 import config
 from llm_interface import LLMInterface
 from vector_store import VectorStore
-from evaluation import evaluate_response, assess_answer_confidence, record_feedback # Assuming this has the correct signature
+from evaluation import evaluate_response, assess_answer_confidence, record_feedback
 from utils import format_reasoning_trace, generate_hop_graph
 
 class CNTRagSystem:
@@ -69,6 +68,7 @@ class CNTRagSystem:
     def _transform_query(self, query: str) -> str:
         """Basic query transformation (lowercase)."""
         self.logger.debug(f"Applying query transformations to: '{query}'")
+        # Add more complex transformations if needed (unit normalization, acronym expansion)
         transformed_query = query.lower()
         if transformed_query != query:
             self.logger.info(f"Query transformed: '{query}' -> '{transformed_query}'")
@@ -131,14 +131,13 @@ class CNTRagSystem:
         self.logger.info(f"Generated {len(unique_queries)} unique queries: {unique_queries}")
         return unique_queries
 
-    def _reason_and_refine_query(self, original_query: str, accumulated_context: str, history: List[str], current_hop: int, retrieval_failed_last: bool = False) -> Tuple[str, str]:
+    def _reason_and_refine_query(self, original_query: str, accumulated_context: str, history: List[str], current_hop: int) -> Tuple[str, str]:
         """Uses the LLM to decide the next step based on user type."""
         self.logger.info(f"--- Hop {current_hop} Reasoning for '{self.user_type}' user ---")
         context_snippet = accumulated_context.strip()[:500]
         self.logger.debug(f"Reasoning based on History: {' -> '.join(history)}")
         self.logger.debug(f"Context Snippet Provided:\n{context_snippet if context_snippet else 'None'}...\n")
-        if retrieval_failed_last:
-             self.logger.warning(f"Reasoning invoked after retrieval failure in hop {current_hop}.")
+
         common_reasoning_intro = f"""
         Your SOLE task is to determine the *next action* based on the Original Question and the Accumulated Context retrieved so far.
 
@@ -261,36 +260,8 @@ class CNTRagSystem:
             context_parts.append(f"[{source_info}]\n{chunk.get('text', '')}")
         return "\n\n---\n\n".join(context_parts)
 
-    def _summarize_text_block(self, text_to_summarize: str, original_query_for_context: Optional[str] = None) -> str:
-        if not text_to_summarize.strip():
-            return ""
-        self.logger.info(f"Summarizing text block (length: {len(text_to_summarize)})...")
-        query_guidance = f"Focus on details relevant to the original question: '{original_query_for_context}'" if original_query_for_context else ""
-        summary_prompt = f"""Summarize the following context section from scientific literature or experimental data regarding Carbon Nanotubes (CNTs).
-        The user asking the question is considered '{self.user_type}'.
-        Preserve all key scientific findings, experimental parameters (temperature, pressure, catalyst, etc.), numerical results, material properties, characterization data (e.g., Raman shifts, diameters), and specific CNT types (SWCNT, MWCNT, chirality) mentioned.
-        {query_guidance}
-        Be concise but retain the essential scientific information needed to answer questions based on this section.
 
-        Context Section to Summarize:
-        ---
-        {text_to_summarize[:config.MAX_CONTEXT_TOKENS * 2]}
-        ---
-
-        Concise Scientific Summary:"""
-        summarized = self.llm_interface.generate_response(summary_prompt)
-        if summarized.startswith("LLM_ERROR"):
-            self.logger.error(f"Failed to summarize text block: {summarized}. Returning original (potentially truncated).")
-            return text_to_summarize[:self.max_context_tokens // 2]
-        else:
-            self.logger.info("Summarization of text block complete.")
-            return summarized
-
-    def _manage_context(self,
-                        accumulated_context_list: List[str],
-                        new_chunk_list: List[Dict[str, Any]],
-                        original_query: str
-                       ) -> Tuple[List[str], List[Dict[str, Any]]]:
+    def _manage_context(self, accumulated_context_list: List[str], new_chunk_list: List[Dict[str, Any]]) -> Tuple[List[str], List[Dict[str, Any]]]:
         if not new_chunk_list:
             self.logger.debug("No new chunks to manage.")
             return accumulated_context_list, []
@@ -302,78 +273,79 @@ class CNTRagSystem:
             if text not in unique_new_chunks_by_text or chunk.get('score', 0) > unique_new_chunks_by_text[text].get('score', 0):
                  unique_new_chunks_by_text[text] = chunk
         deduped_new_chunks = list(unique_new_chunks_by_text.values())
+        if len(deduped_new_chunks) < len(new_chunk_list):
+            self.logger.debug(f"Removed {len(new_chunk_list) - len(deduped_new_chunks)} exact duplicates from current hop.")
 
         existing_texts = set()
         for ctx_str in accumulated_context_list:
              text_content = ctx_str
              match = re.search(r'\]\s*(.*)', ctx_str, re.DOTALL | re.IGNORECASE) or re.search(r'\]:\s*\n?(.*)', ctx_str, re.DOTALL | re.IGNORECASE)
-             if match: text_content = match.group(1).strip()
-             else: text_content = ctx_str.strip()
-             if text_content.startswith(("[SUMMARIZED CONTEXT]:", "[SUMMARIZED HOP CONTEXT]:")):
-                 text_content = re.sub(r"^\[SUMMARIZED (?:HOP )?CONTEXT\]:\s*", "", text_content, flags=re.IGNORECASE).strip()
-             existing_texts.add(text_content)
+             if match: text_content = match.group(1)
+             existing_texts.add(text_content.strip())
 
-        truly_new_chunks_list_of_dicts = []
-        for chunk_dict in deduped_new_chunks:
-            text_to_check = chunk_dict.get('text', '')
+        truly_new_chunks = []
+        for chunk in deduped_new_chunks:
+            text = chunk.get('text', '')
             is_similar = False
             for existing_text in existing_texts:
-                 if text_to_check == existing_text or SequenceMatcher(None, text_to_check, existing_text).ratio() > self.similarity_threshold:
+                 if text == existing_text or SequenceMatcher(None, text, existing_text).ratio() > self.similarity_threshold:
                      is_similar = True
                      self.logger.debug("Found new chunk identical or highly similar to existing context. Skipping.")
                      break
             if not is_similar:
-                 truly_new_chunks_list_of_dicts.append(chunk_dict)
-                 existing_texts.add(text_to_check)
+                 truly_new_chunks.append(chunk)
+                 existing_texts.add(text) 
 
-        if not truly_new_chunks_list_of_dicts:
-            self.logger.info("No truly new, unique context chunks found in this hop after deduplication.")
+        if len(truly_new_chunks) < len(deduped_new_chunks):
+            self.logger.info(f"Removed {len(deduped_new_chunks) - len(truly_new_chunks)} chunks similar to existing context.")
+
+        if not truly_new_chunks:
+            self.logger.info("No truly new, unique context chunks found in this hop.")
             return accumulated_context_list, []
 
-        current_context_list = list(accumulated_context_list)
-        new_context_string_for_this_hop = self._format_context_from_chunks(truly_new_chunks_list_of_dicts)
-
-        if new_context_string_for_this_hop.strip():
-            if self.llm_interface.llm_provider != "google":
-                self.logger.info(f"LLM Provider is '{self.llm_interface.llm_provider}'. Summarizing new context from this hop...")
-                summarized_new_context = self._summarize_text_block(new_context_string_for_this_hop, original_query)
-                if summarized_new_context.strip():
-                    current_context_list.append(f"[SUMMARIZED HOP CONTEXT]:\n{summarized_new_context}")
-                    self.logger.info(f"Added summarized hop context. Current list length: {len(current_context_list)}")
-                else:
-                    self.logger.warning("Summarization of new hop context resulted in empty string. Adding original formatted chunks for this hop instead.")
-                    current_context_list.append(new_context_string_for_this_hop)
-                    self.logger.info(f"Added original (non-summarized) hop context. Current list length: {len(current_context_list)}")
-            else:
-                self.logger.info(f"LLM Provider is 'google'. Adding raw formatted chunks from this hop.")
-                current_context_list.append(new_context_string_for_this_hop)
-                self.logger.info(f"Added raw hop context for Google. Current list length: {len(current_context_list)}")
-        else:
-            self.logger.debug("Formatted new context string for this hop is empty. Not adding to context list.")
+        new_context_string = self._format_context_from_chunks(truly_new_chunks)
+        current_context_list = accumulated_context_list + [new_context_string]
 
         estimated_tokens = sum(len(ctx) for ctx in current_context_list) / self.char_to_token_ratio
-        self.logger.debug(f"Context size before *overall* summarization: ~{estimated_tokens:.0f} tokens. List length: {len(current_context_list)}")
+        self.logger.debug(f"Context size before potential summarization: ~{estimated_tokens:.0f} tokens")
 
         while estimated_tokens > self.max_context_tokens and len(current_context_list) > 1:
-             self.logger.info(f"Overall context too large ({estimated_tokens:.0f} > {self.max_context_tokens} tokens), summarizing oldest overall context block...")
-             oldest_context_block = current_context_list.pop(0)
-             if oldest_context_block.strip().startswith("[SUMMARIZED CONTEXT]:"):
-                 self.logger.warning("Oldest context block is already an *overall* summary. Keeping it.")
-                 current_context_list.insert(0, oldest_context_block)
-                 break
-             summarized_oldest_block = self._summarize_text_block(oldest_context_block, original_query)
-             if not summarized_oldest_block.strip():
-                  self.logger.error("Summarization of oldest block yielded empty string. Discarding block.")
+             self.logger.info(f"Context too large ({estimated_tokens:.0f} > {self.max_context_tokens} tokens), summarizing oldest...")
+             oldest_context = current_context_list.pop(0)
+
+             if oldest_context.strip().startswith("[SUMMARIZED CONTEXT]:"):
+                 self.logger.warning("Oldest context already summarized. Keeping.")
+                 current_context_list.insert(0, oldest_context) 
+                 break 
+
+             summary_prompt = f"""Summarize the following context section from scientific literature or experimental data regarding Carbon Nanotubes (CNTs).
+             Preserve all key scientific findings, experimental parameters (temperature, pressure, catalyst, etc.), numerical results, material properties, characterization data (e.g., Raman shifts, diameters), and specific CNT types (SWCNT, MWCNT, chirality) mentioned.
+             Be concise but retain the essential scientific information.
+
+             Context Section to Summarize:
+             ---
+             {oldest_context}
+             ---
+
+             Concise Scientific Summary:"""
+             summarized = self.llm_interface.generate_response(summary_prompt)
+
+             if summarized.startswith("LLM_ERROR"):
+                 self.logger.error(f"Failed to summarize context: {summarized}. Keeping original.")
+                 current_context_list.insert(0, oldest_context) 
+                 break 
              else:
-                  current_context_list.insert(0, f"[SUMMARIZED CONTEXT]:\n{summarized_oldest_block}")
-                  self.logger.info("Overall summarization of oldest block complete.")
+                 current_context_list.insert(0, f"[SUMMARIZED CONTEXT]:\n{summarized}")
+                 self.logger.info("Summarization complete.")
+
              estimated_tokens = sum(len(ctx) for ctx in current_context_list) / self.char_to_token_ratio
-             self.logger.info(f"Context size after *overall* summarization of oldest: ~{estimated_tokens:.0f} tokens")
+             self.logger.info(f"Context size after summarization: ~{estimated_tokens:.0f} tokens")
 
         if estimated_tokens > self.max_context_tokens:
-            self.logger.warning(f"Final context size (~{estimated_tokens:.0f}) still exceeds max_tokens ({self.max_context_tokens}) after all summarization attempts.")
+            self.logger.warning(f"Context size (~{estimated_tokens:.0f}) still exceeds max tokens ({self.max_context_tokens}) after summarization attempt.")
 
-        return current_context_list, truly_new_chunks_list_of_dicts
+        return current_context_list, truly_new_chunks
+
 
     def _generate_final_answer(self, original_query: str, accumulated_context_list: List[str]) -> str:
         """Generates the final answer from the accumulated context based on user type."""
@@ -452,11 +424,12 @@ class CNTRagSystem:
              final_response = re.sub(r"^\s*Final Synthesized Answer:?\s*", "", final_response, flags=re.IGNORECASE).strip()
              return final_response
 
+    # --- Main Process Method ---
     def process_query(self, question: str, top_k: int = config.DEFAULT_TOP_K, max_hops: int = config.DEFAULT_MAX_HOPS,
                       use_query_expansion: bool = False,
                       request_evaluation: bool = True,
                       generate_graph: bool = True,
-                      record_user_feedback: Optional[Dict[str, Any]] = None
+                      record_user_feedback: Optional[Dict[str, Any]] = None 
                       ) -> Dict[str, Any]:
         process_start_time = time.time()
         self.logger.info(f"\n--- Starting CNT Query Process for '{self.user_type}' user ---")
@@ -465,29 +438,25 @@ class CNTRagSystem:
 
         if not self.vector_store.is_ready():
              self.logger.critical("Vector database is not ready. Cannot process query.")
-             return {"final_answer": "Error: Knowledge base not available.", "source_info": "Initialization Error", "reasoning_trace": ["Vector DB not ready"], "formatted_reasoning": "Vector DB not ready", "confidence_score": None, "evaluation_metrics": None, "debug_info": {"processing_time_s": time.time() - process_start_time, "hops_taken": 0, "graph_filename": None}}
+             return {"final_answer": "Error: Knowledge base not available.", "source_info": "Initialization Error", "reasoning_trace": ["Vector DB not ready"], "formatted_reasoning": "Vector DB not ready", "confidence_score": None, "evaluation_metrics": None, "debug_info": {"processing_time_s": time.time() - process_start_time, "hops_taken": 0}}
 
         original_query = question
         current_query = self._transform_query(original_query)
 
-        accumulated_context_list: List[str] = []
-        reasoning_trace: List[str] = ["START"]
-        search_query_history: List[str] = [current_query]
-        hops_taken: int = 0
-        graph_query_history: List[str] = [current_query]
-        action: Optional[str] = None # Initialize action
+        accumulated_context_list = []
+        reasoning_trace = ["START"]
+        search_query_history = [current_query] 
+        hops_taken = 0
+        graph_query_history = [current_query] 
 
         if use_query_expansion:
              self.logger.info("Applying initial query expansion...")
              expanded_queries = self._expand_query(current_query, num_expansions=2)
-             if expanded_queries: # Ensure it's not empty
-                 # Use the first one for the initial hop, log all for history/graph
-                 current_query = expanded_queries[0]
-                 search_query_history = list(dict.fromkeys(expanded_queries)) # Keep unique ones
-                 graph_query_history = list(dict.fromkeys(expanded_queries))
+             if expanded_queries and len(expanded_queries) > 1: 
+                 search_query_history = expanded_queries 
+                 current_query = expanded_queries[0] 
+                 graph_query_history = expanded_queries 
                  reasoning_trace.append(f"Initial Expanded Queries: {expanded_queries}")
-
-
         for hop in range(max_hops):
             hops_taken = hop + 1
             self.logger.info(f"\n--- Hop {hops_taken}/{max_hops} ---")
@@ -498,92 +467,67 @@ class CNTRagSystem:
                  reasoning_trace.append(f"Hop {hops_taken}: Error - Query empty.")
                  break
 
-            # --- CORRECTED INITIALIZATION ---
-            retrieval_succeeded_this_hop = False # Initialize for each hop
-
             self.logger.info(f"Retrieving context for query: '{current_query}'")
             reasoning_trace.append(f"Hop {hops_taken}: Retrieving with query -> '{current_query}'")
             query_embedding = self.llm_interface.get_embedding(current_query, task_type="RETRIEVAL_QUERY")
 
-            retrieved_chunks: List[Dict[str,Any]] = [] # Ensure it's defined
             if query_embedding is None:
-                self.logger.error("Query embedding failed. Cannot retrieve.")
+                self.logger.error("Query embedding failed. Cannot retrieve. Breaking hop.")
                 reasoning_trace.append(f"Hop {hops_taken}: Query embedding failed.")
-                # retrieval_succeeded_this_hop remains False
+                action, value = "ANSWER_COMPLETE", "Embedding failed" 
             else:
                 retrieved_chunks = self.vector_store.query(query_embedding, top_k=top_k)
+
                 if not retrieved_chunks:
                      self.logger.warning(f"Retrieval returned no relevant chunks for hop {hops_taken}.")
                      reasoning_trace.append(f"Hop {hops_taken}: Retrieval yielded no results.")
-                     # retrieval_succeeded_this_hop remains False
                 else:
                      self.logger.info(f"Retrieved {len(retrieved_chunks)} chunks for hop {hops_taken}.")
-                    #  reasoning_trace.append(f"Hop {hops_taken}: Retrieved {len(retrieved_chunks)} chunk(s). Top score: {retrieved_chunks[0]['score']:.4f if retrieved_chunks else 'N/A'}")
-                     top_score_str = f"{retrieved_chunks[0]['score']:.4f}" if retrieved_chunks else "N/A"
-                     reasoning_trace.append(f"Hop {hops_taken}: Retrieved {len(retrieved_chunks)} chunk(s). Top score: {top_score_str}")
-                     retrieval_succeeded_this_hop = True
-            
-            accumulated_context_list, added_unique_chunks_dicts = self._manage_context(
-                 accumulated_context_list,
-                 retrieved_chunks,
-                 original_query
-            )
-            if added_unique_chunks_dicts:
-                 reasoning_trace.append(f"Hop {hops_taken}: Processed {len(added_unique_chunks_dicts)} unique chunks for context (may be summarized).")
-            elif retrieved_chunks:
-                 reasoning_trace.append(f"Hop {hops_taken}: No new unique chunks added to context (all duplicates/similar).")
+                     reasoning_trace.append(f"Hop {hops_taken}: Retrieved {len(retrieved_chunks)} chunk(s). Top score: {retrieved_chunks[0]['score']:.4f}")
 
-            full_context_for_reasoning = "\n\n==== CONTEXT FROM HOP/SUMMARY SEPARATOR ====\n\n".join(accumulated_context_list)
-            system_note = "[System Note: Retrieval for the last query failed.]\n\n"
-            context_to_send_reasoner = (system_note + full_context_for_reasoning
-                                        if not retrieval_succeeded_this_hop and hop > 0 # Add note if this hop failed AND not first hop
-                                        else full_context_for_reasoning)
+                accumulated_context_list, added_chunks = self._manage_context(accumulated_context_list, retrieved_chunks)
+                if added_chunks:
+                    reasoning_trace.append(f"Hop {hops_taken}: Added {len(added_chunks)} unique chunks to context.")
+                elif retrieved_chunks:
+                    reasoning_trace.append(f"Hop {hops_taken}: No new unique chunks added (duplicates/similar).")
 
-            action, value = self._reason_and_refine_query(
-                original_query,
-                context_to_send_reasoner,
-                graph_query_history,
-                hops_taken,
-                retrieval_failed_last=(not retrieval_succeeded_this_hop)
-            )
-            reasoning_trace.append(f"Hop {hops_taken}: Reasoning result -> Action='{action}', Value='{value[:100]}...'")
-
+                full_context_for_reasoning = "\n\n==== CONTEXT FROM HOP/SUMMARY SEPARATOR ====\n\n".join(accumulated_context_list)
+                action, value = self._reason_and_refine_query(original_query, full_context_for_reasoning, graph_query_history, hops_taken)
+                reasoning_trace.append(f"Hop {hops_taken}: Reasoning result -> Action='{action}', Value='{value[:100]}...'")
             if action == "ANSWER_COMPLETE":
                  self.logger.info("Reasoning concluded: ANSWER_COMPLETE.")
                  reasoning_trace.append(f"Hop {hops_taken}: Reasoning -> ANSWER_COMPLETE. Proceeding to final answer.")
-                 break
+                 break 
             elif action == "NEXT_QUERY":
                  next_raw_query = value
-                 current_query = self._transform_query(next_raw_query)
+                 current_query = self._transform_query(next_raw_query) 
                  reasoning_trace.append(f"Hop {hops_taken}: Reasoning -> NEXT_QUERY = '{current_query}'")
-                 if not search_query_history or current_query != search_query_history[-1]:
-                     search_query_history.append(current_query)
-                 if not graph_query_history or current_query != graph_query_history[-1]:
-                      graph_query_history.append(current_query)
-            else:
+                 search_query_history.append(current_query) 
+                 graph_query_history.append(current_query) 
+            else: 
                  self.logger.error(f"Reasoning resulted in '{action}': {value}. Stopping multihop.")
                  reasoning_trace.append(f"Hop {hops_taken}: Reasoning -> {action}: {value}. Proceeding to final answer.")
-                 break
-
-        if hops_taken == max_hops and action != "ANSWER_COMPLETE": # Check if action was set
-            self.logger.info("Max hops reached. Proceeding to final answer generation.")
+                 break 
+        if hops_taken == max_hops and action != "ANSWER_COMPLETE":
+            self.logger.info("Max hops reached. Proceeding to final answer.")
             reasoning_trace.append(f"Max hops ({max_hops}) reached.")
 
         reasoning_trace.append("--- Final Answer Generation ---")
+
         final_answer = self._generate_final_answer(original_query, accumulated_context_list)
 
         confidence_score = None
         evaluation_metrics = None
         final_context_str = "\n\n==== CONTEXT FROM HOP/SUMMARY SEPARATOR ====\n\n".join(accumulated_context_list)
 
-        if not final_answer.startswith(("LLM_ERROR:", "I encountered an error", "Based on the retrieved")):
+        if not final_answer.startswith(("LLM_ERROR:", "I encountered an error", "Based on the retrieved", "I looked through the available information")):
             confidence_score = assess_answer_confidence(final_answer, final_context_str, original_query, self.llm_interface, self.logger)
             reasoning_trace.append(f"Confidence Score: {confidence_score:.2f}" if confidence_score is not None else "Confidence Score: N/A")
+
             if request_evaluation:
                  evaluation_metrics = evaluate_response(original_query, final_answer, final_context_str, self.llm_interface, self.logger)
                  eval_summary = {k: v for k, v in evaluation_metrics.items() if 'rating' in k}
                  reasoning_trace.append(f"Evaluation Metrics: {eval_summary}")
-
         formatted_reasoning = format_reasoning_trace(reasoning_trace)
         graph_filename = None
         if generate_graph:
@@ -599,38 +543,36 @@ class CNTRagSystem:
         debug_info = {
             "processing_time_s": round(processing_time, 2),
             "hops_taken": hops_taken,
-            "queries_used": list(dict.fromkeys(search_query_history)),
+            "queries_used": list(dict.fromkeys(search_query_history)), 
             "final_context_length": len(final_context_str),
             "vector_db_type": type(self.vector_store).__name__,
             "embedding_cache_hits": cache_stats["embedding_cache_hits"],
             "llm_cache_hits": cache_stats["llm_cache_hits"],
             "graph_filename": graph_filename
         }
-
         user_rating = record_user_feedback.get('rating') if record_user_feedback else None
         user_comment = record_user_feedback.get('comment') if record_user_feedback else None
-        # Make sure record_feedback has the correct signature in evaluation.py
         record_feedback(
-            feedback_history=self.feedback_history,
+            feedback_history=self.feedback_history, 
             feedback_db_path=self.feedback_db_path,
             logger=self.logger,
             query=original_query,
             answer=final_answer,
             hop_count=hops_taken,
-            final_context=final_context_str,
+            final_context=final_context_str, 
             reasoning_trace=reasoning_trace,
             search_query_history=list(dict.fromkeys(search_query_history)),
             user_rating=user_rating,
             user_comment=user_comment,
             evaluation_metrics=evaluation_metrics,
             confidence_score=confidence_score,
-            debug_info=debug_info
+            debug_info=debug_info 
         )
 
         return {
             "final_answer": final_answer,
             "source_info": f"Synthesized from context ({type(self.vector_store).__name__}) over {hops_taken} hop(s).",
-            "reasoning_trace": reasoning_trace,
+            "reasoning_trace": reasoning_trace, 
             "formatted_reasoning": formatted_reasoning,
             "confidence_score": confidence_score,
             "evaluation_metrics": evaluation_metrics,
