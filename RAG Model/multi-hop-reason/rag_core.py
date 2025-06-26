@@ -49,10 +49,6 @@ class CNTRagSystem:
         self.logger = logger
         self.feedback_db_path = feedback_db_path
         self.feedback_history = feedback_history # Use the passed list
-        # self.user_type = user_type.lower()
-        # if self.user_type not in ["novice", "advanced"]:
-        #     self.logger.warning(f"Invalid user_type '{self.user_type}'. Defaulting to 'novice'.")
-        #     self.user_type = "novice"
         self.user_type = 'advanced'
         self.graph_dir = graph_dir
         self.max_context_tokens = max_context_tokens
@@ -61,8 +57,6 @@ class CNTRagSystem:
 
         if not self.vector_store.is_ready():
             self.logger.critical("Vector store provided is not ready (loaded or built). RAG system may fail.")
-            # Optionally raise an error here if a ready store is mandatory at init
-            # raise RuntimeError("VectorStore must be loaded or built before initializing CNTRagSystem")
 
     # --- Query Processing Steps ---
 
@@ -163,26 +157,6 @@ class CNTRagSystem:
         - NO explanations in your output.
         """
         
-        # if self.user_type == "novice":
-        #     prompt = f"""You are a precise reasoning engine for a RAG system answering questions about Carbon Nanotube (CNT) research papers and data for a *novice user*.
-        #     The user needs clear and simple explanations, so the context should be sufficient to provide such an answer.
-        #     {common_reasoning_intro}
-        #     Instructions:
-        #     1. Analyze if the Accumulated Context *directly and completely* answers the Original Question in a way that can be explained simply to a novice.
-        #     2. Consider the search queries used so far.
-        #     3. Decide the single next action:
-        #         a. If context fully answers for a novice: Output *exactly*: ANSWER_COMPLETE
-        #         b. If context is insufficient for a simple explanation, identify the *single most important missing piece* or *next logical sub-question* to find simpler or more foundational information. Formulate a *concise, specific search query* for this. Output *exactly* in this format: NEXT_QUERY: [Your concise query here]
-        #         c. If retrieval errors occurred or context is irrelevant/too complex for a novice, output: ANSWER_COMPLETE
-
-        #     Reasoning Steps (Think Internally before deciding):
-        #     1. What is the core information needed to answer the Original Question for a novice?
-        #     2. Does the Accumulated Context contain this core information in an understandable way?
-        #     3. Are there specific, critical gaps for a novice's understanding?
-        #     4. Based on the gaps, what is the most effective *next* query for simpler information, or is the answer complete?
-        #     {common_reasoning_critical}
-        #     Decision:"""
-        # elif self.user_type == "advanced":
         prompt = f"""You are an expert reasoning engine for a RAG system assisting an *advanced researcher* with questions about Carbon Nanotube (CNT) research.
         The user is looking for detailed technical insights, numerical trends, and potential optimizations.
         {common_reasoning_intro}
@@ -205,24 +179,6 @@ class CNTRagSystem:
         4. Based on these gaps, what is the most effective *next* technical query to deepen the understanding or explore optimizations, or is the answer complete?
         {common_reasoning_critical}
         Decision:"""
-        # else: # Default
-        #     self.logger.error("User type not properly set for reasoning, using default prompt.") # Should not happen
-        #     prompt = f"""You are a precise reasoning engine for a RAG system answering questions about Carbon Nanotube (CNT) research papers and data.
-        #     {common_reasoning_intro}
-        #     Instructions:
-        #     1. Analyze if the Accumulated Context *directly and completely* answers the Original Question.
-        #     2. Consider the search queries used so far.
-        #     3. Decide the single next action:
-        #         a. If context fully answers: Output *exactly*: ANSWER_COMPLETE
-        #         b. If context is insufficient, identify the *single most important missing piece* or *next logical sub-question*. Formulate a *concise, specific scientific search query* for this. Output *exactly* in this format: NEXT_QUERY: [Your concise query here]
-        #         c. If retrieval errors occurred or context is irrelevant, output: ANSWER_COMPLETE
-        #     Reasoning Steps (Think Internally before deciding):
-        #     1. What is the core information needed to answer the Original Question?
-        #     2. Does the Accumulated Context contain this core information? List supporting evidence/snippets briefly.
-        #     3. Are there specific, critical gaps remaining? If so, what are they?
-        #     4. Based on the gaps, what is the most effective *next* query, or is the answer complete?
-        #     {common_reasoning_critical}
-        #     Decision:"""
         
         response_text = self.llm_interface.generate_response(prompt)
 
@@ -252,15 +208,27 @@ class CNTRagSystem:
         return action, value
 
     def _format_context_from_chunks(self, chunks: List[Dict[str, Any]]) -> str:
-        if not chunks: return "No relevant context found."
-        context_parts = []
-        for chunk in chunks:
-            metadata = chunk.get('metadata', {})
-            score = chunk.get('score', 0.0)
-            source_info = f"Source: Doc='{metadata.get('document_name', 'N/A')}', Loc={metadata.get('page_number', 'N/A')}, Score={score:.4f}"
-            context_parts.append(f"[{source_info}]\n{chunk.get('text', '')}")
-        return "\n\n---\n\n".join(context_parts)
+        """Formats the retrieved chunks into a string for the LLM prompt, including detailed source."""
+        if not chunks:
+             return "No relevant context found."
 
+        context_parts = []
+        for chunk_dict in chunks:
+            metadata = chunk_dict.get('metadata', {})
+            score = chunk_dict.get('score', 0.0)
+            
+            # Construct a detailed, parsable source string for the LLM
+            source_info_str = (
+                f"[Source: Doc: '{metadata.get('document_name', 'N/A')}', "
+                f"Page: {metadata.get('page_number', 'N/A')}, "
+                f"ChunkID: '{metadata.get('chunk_id', 'N/A')}', "
+                f"Score: {score:.4f}]"
+            )
+            
+            context_parts.append(f"{source_info_str}\n{chunk_dict.get('text', '')}")
+
+        return "\n\n---\n\n".join(context_parts)
+    
     def _summarize_text_block(self, text_to_summarize: str, original_query_for_context: Optional[str] = None) -> str:
         if not text_to_summarize.strip():
             return ""
@@ -376,72 +344,37 @@ class CNTRagSystem:
         return current_context_list, truly_new_chunks_list_of_dicts
 
     def _generate_final_answer(self, original_query: str, accumulated_context_list: List[str]) -> str:
-        """Generates the final answer from the accumulated context based on user type."""
+        """Generates the final answer, prompting the LLM to cite its sources."""
         self.logger.info(f"Generating final answer for '{self.user_type}' user from accumulated context...")
         final_context_str = "\n\n==== CONTEXT FROM HOP/SUMMARY SEPARATOR ====\n\n".join(accumulated_context_list)
 
-        if not final_context_str or final_context_str.strip() == "No relevant context found.":
+        if not final_context_str.strip() or final_context_str.strip() == "No relevant context found.":
             self.logger.warning("No context available for final answer generation.")
-            if self.user_type == "novice":
-                return "I looked through the available information, but I couldn't find what's needed to answer your question simply."
-            else: # Advanced user
-                return "Based on the retrieved scientific literature and data, a detailed technical analysis could not be performed due to insufficient specific information in the context."
+            return "Based on the retrieved information, a detailed analysis could not be performed due to insufficient context."
 
-        common_final_answer_intro = f"""
-        Your task is to synthesize a final, coherent, and technically detailed answer to the user's *Original Question* using *only* the information found within the *Accumulated Context* provided below.
+        # This prompt is the same as before and works perfectly for this goal
+        prompt = f"""You are an expert researcher synthesizing a detailed technical analysis for an advanced colleague on Carbon Nanotubes (CNTs).
 
-        Original Question:
+        **Original Question:**
         "{original_query}"
 
-        Accumulated Context:
+        **Accumulated Context:**
+        Use ONLY the following context to answer the question. Each piece of context is preceded by its source information in the format [Source: Doc: '...', Page: ..., ChunkID: '...'].
         --- START CONTEXT ---
         {final_context_str}
         --- END CONTEXT ---
+
+        **Your Task:**
+        1.  **Synthesize and Structure:** Write a comprehensive, well-structured answer to the "Original Question". Organize your answer into logical sections with clear, bolded headings (e.g., using Markdown like **Heading Title**). Explain concepts and their relationships.
+        2.  **Cite Everything:** You MUST cite every piece of information you use from the context. Place the citation at the end of the sentence or clause that uses the information.
+        3.  **Citation Format:** The citation format MUST BE: `(Source: Doc: '[Doc]', Page: [Page], ChunkID: '[ChunkID]')`.
+        4.  **Strictly Adhere to Context:** Base your entire answer ONLY on the "Accumulated Context".
+        5.  **Identify Gaps:** After providing the main answer, add a final section titled "**Missing Information**". In this section, describe what specific technical details are needed but are not present in the provided context.
+
+        ---
+        **Final Synthesized Answer (Detailed, Structured, and with In-Text Citations):**
         """
-
-        # if self.user_type == "novice":
-        #     # Inspired by Novice AgenticRAG.generate_final_answer
-        #     prompt = f"""You are answering a question for someone new to the field of Carbon Nanotubes (CNTs).
-        #     {common_final_answer_intro}
-        #     Based on the research results in the Accumulated Context, provide a clear and simple answer to the Original Question.
-        #     Use beginner-friendly language. Avoid complex terms if possible, and if you must use a technical term that might be unfamiliar, briefly explain it in simple terms.
-        #     Include practical insights or real-world examples if the context supports them, explaining them plainly.
-        #     If there are numerical values or data points, explain what they mean in simple terms (e.g., "this temperature is very hot, like an oven" or "this means it grew very little").
-        #     Aim for a concise answer, like a short summary, but ensure it's helpful and directly answers the question for a novice.
-        #     If the context definitively lacks the info needed for a simple explanation, state clearly: "Based on the information I found, I cannot provide a simple answer regarding [specific aspect of the question]."
-
-        #     Final Synthesized Answer (simple and clear for a novice, based ONLY on context):"""
-        # elif self.user_type == "advanced":
-            # NEW ADVANCED PROMPT INSPIRED BY YOUR AgenticRAG EXAMPLE
-        prompt = f"""You are an experienced researcher synthesizing a detailed technical analysis for an advanced colleague on Carbon Nanotubes (CNTs).
-        The user seeks a deep understanding based *only* on the *Accumulated Context* provided, in relation to the *Original Question*.
-
-        {common_final_answer_intro} # This includes Original Question and Accumulated Context.
-
-        As an experienced researcher, your response should:
-        1.  **Identify Key Influencing Parameters**: From the Original Question and, more importantly, from the Accumulated Context, identify the critical experimental conditions (e.g., temperature settings, catalyst composition/thickness), material characteristics (e.g., diameter, chirality, defect density), or process details (e.g., functionalization methods, synthesis techniques like CVD) that are discussed in relation to the query.
-        2.  **Provide In-depth Analysis based on these identified parameters and the context**:
-            a.  **Technical Explanation of Interplay**: Deliver a comprehensive technical explanation of the interplay between these identified parameters. Emphasize the underlying mechanisms (as described in the context) that affect CNT growth, stability, final properties (e.g., mechanical, electronic, optical), functionalization outcomes, or scalability.
-            b.  **Numerical Insights and Trends**: If the context provides specific numerical data, quantitative trends, or correlations (e.g., catalyst thickness vs. growth kinetics, optimal temperature ranges for specific outcomes), discuss these in-depth. Include any theoretical or experimental justifications for these trends *if they are mentioned in the context*.
-            c.  **Theory-Based Aspects**: For questions that are primarily theoretical, discuss underlying mechanisms and material properties as detailed in the context, referencing scientific principles or models *if explicitly stated in the context*.
-            d.  **Practical/Experimental Aspects**: For practical or experimental queries, discuss relevant experimental observations, potential adjustments, or challenges as presented in the context.
-        3.  **Comprehensive and Integrated Response**: Ensure your answer is exhaustive yet focused, integrating theoretical concepts with practical implications as supported by the context. Highlight both foundational knowledge and specific findings present in the provided materials.
-        4.  **Strict Adherence to Context**: Your entire answer MUST be derived solely from the Accumulated Context. Do NOT introduce external knowledge, assumptions, or information not explicitly present.
-        5.  **Handling Insufficient Context for Detailed Analysis**: If the Accumulated Context lacks the specific details to perform the requested in-depth analysis for key aspects of the Original Question, clearly state what specific information is missing from the provided texts. For instance: "While the context mentions [general topic], it does not provide specific data on [e.g., the quantitative impact of catalyst X on chirality distribution, detailed kinetic models for functionalization Y, or a comparative analysis of defect types on Z property] required for a full advanced analysis of [aspect of original question]."
-        6.  **Structure**: Present the answer logically and technically. Do NOT refer to the search process or source markers (`[Source: ...]`).
-
-        Final Synthesized Answer (Detailed, Technical, Exhaustive based ONLY on context):"""
-        # else: # Default
-        #     self.logger.error("User type not properly set for final answer, using default prompt.")
-        #     # ... (original default prompt)
-        #     prompt = f"""You are an expert scientific assistant knowledgeable about Carbon Nanotubes (CNTs).
-        #     {common_final_answer_intro}
-        #     Further Instructions:
-        #     - Synthesize a single, coherent answer that directly addresses the *Original Question* with scientific accuracy.
-        #     - If the context definitively lacks the info needed, state clearly: "Based on the provided context, the specific information regarding [missing aspect] could not be found."
-
-        #     Final Synthesized Answer (based ONLY on context):"""
-
+        
         final_response = self.llm_interface.generate_response(prompt)
 
         if final_response.startswith("LLM_ERROR"):
@@ -449,7 +382,7 @@ class CNTRagSystem:
              return f"I encountered an error while trying to generate the final answer ({final_response})."
         else:
              self.logger.info(f"Final answer generated (length: {len(final_response)}).")
-             final_response = re.sub(r"^\s*Final Synthesized Answer:?\s*", "", final_response, flags=re.IGNORECASE).strip()
+             final_response = re.sub(r"^\s*Final Synthesized Answer:?.*?\s*", "", final_response, flags=re.IGNORECASE | re.DOTALL).strip()
              return final_response
 
     def process_query(self, question: str, top_k: int = config.DEFAULT_TOP_K, max_hops: int = config.DEFAULT_MAX_HOPS,
@@ -465,7 +398,7 @@ class CNTRagSystem:
 
         if not self.vector_store.is_ready():
              self.logger.critical("Vector database is not ready. Cannot process query.")
-             return {"final_answer": "Error: Knowledge base not available.", "source_info": "Initialization Error", "reasoning_trace": ["Vector DB not ready"], "formatted_reasoning": "Vector DB not ready", "confidence_score": None, "evaluation_metrics": None, "debug_info": {"processing_time_s": time.time() - process_start_time, "hops_taken": 0, "graph_filename": None}}
+             return {"final_answer": "Error: Knowledge base not available.", "retrieved_sources": "Initialization Error", "reasoning_trace": [], "formatted_reasoning": "Vector DB not ready", "confidence_score": None, "evaluation_metrics": None, "debug_info": {}}
 
         original_query = question
         current_query = self._transform_query(original_query)
@@ -474,19 +407,23 @@ class CNTRagSystem:
         reasoning_trace: List[str] = ["START"]
         search_query_history: List[str] = [current_query]
         hops_taken: int = 0
+        
+        # --- FIX: Initialize graph_query_history here ---
         graph_query_history: List[str] = [current_query]
-        action: Optional[str] = None # Initialize action
+        # --------------------------------------------------
+
+        action: Optional[str] = None
+        final_context_sources: List[Dict[str, Any]] = []
+        unique_chunk_ids_in_context = set()
 
         if use_query_expansion:
              self.logger.info("Applying initial query expansion...")
              expanded_queries = self._expand_query(current_query, num_expansions=2)
-             if expanded_queries: # Ensure it's not empty
-                 # Use the first one for the initial hop, log all for history/graph
+             if expanded_queries:
                  current_query = expanded_queries[0]
-                 search_query_history = list(dict.fromkeys(expanded_queries)) # Keep unique ones
-                 graph_query_history = list(dict.fromkeys(expanded_queries))
+                 search_query_history = list(dict.fromkeys(expanded_queries))
+                 graph_query_history = list(dict.fromkeys(expanded_queries)) # Overwrite with expanded queries
                  reasoning_trace.append(f"Initial Expanded Queries: {expanded_queries}")
-
 
         for hop in range(max_hops):
             hops_taken = hop + 1
@@ -498,27 +435,22 @@ class CNTRagSystem:
                  reasoning_trace.append(f"Hop {hops_taken}: Error - Query empty.")
                  break
 
-            # --- CORRECTED INITIALIZATION ---
-            retrieval_succeeded_this_hop = False # Initialize for each hop
-
+            retrieval_succeeded_this_hop = False
             self.logger.info(f"Retrieving context for query: '{current_query}'")
             reasoning_trace.append(f"Hop {hops_taken}: Retrieving with query -> '{current_query}'")
             query_embedding = self.llm_interface.get_embedding(current_query, task_type="RETRIEVAL_QUERY")
 
-            retrieved_chunks: List[Dict[str,Any]] = [] # Ensure it's defined
+            retrieved_chunks: List[Dict[str,Any]] = []
             if query_embedding is None:
                 self.logger.error("Query embedding failed. Cannot retrieve.")
                 reasoning_trace.append(f"Hop {hops_taken}: Query embedding failed.")
-                # retrieval_succeeded_this_hop remains False
             else:
                 retrieved_chunks = self.vector_store.query(query_embedding, top_k=top_k)
                 if not retrieved_chunks:
                      self.logger.warning(f"Retrieval returned no relevant chunks for hop {hops_taken}.")
                      reasoning_trace.append(f"Hop {hops_taken}: Retrieval yielded no results.")
-                     # retrieval_succeeded_this_hop remains False
                 else:
                      self.logger.info(f"Retrieved {len(retrieved_chunks)} chunks for hop {hops_taken}.")
-                    #  reasoning_trace.append(f"Hop {hops_taken}: Retrieved {len(retrieved_chunks)} chunk(s). Top score: {retrieved_chunks[0]['score']:.4f if retrieved_chunks else 'N/A'}")
                      top_score_str = f"{retrieved_chunks[0]['score']:.4f}" if retrieved_chunks else "N/A"
                      reasoning_trace.append(f"Hop {hops_taken}: Retrieved {len(retrieved_chunks)} chunk(s). Top score: {top_score_str}")
                      retrieval_succeeded_this_hop = True
@@ -528,21 +460,29 @@ class CNTRagSystem:
                  retrieved_chunks,
                  original_query
             )
+
             if added_unique_chunks_dicts:
-                 reasoning_trace.append(f"Hop {hops_taken}: Processed {len(added_unique_chunks_dicts)} unique chunks for context (may be summarized).")
+                reasoning_trace.append(f"Hop {hops_taken}: Processed {len(added_unique_chunks_dicts)} unique chunks for context.")
+                for chunk_data in added_unique_chunks_dicts:
+                    chunk_id = chunk_data.get('id')
+                    if chunk_id and chunk_id not in unique_chunk_ids_in_context:
+                        final_context_sources.append({
+                            "document_name": chunk_data.get("metadata", {}).get("document_name", "N/A"),
+                            "page_number": chunk_data.get("metadata", {}).get("page_number", "N/A"),
+                            "chunk_id": chunk_id,
+                            "retrieval_score": chunk_data.get("score", 0.0),
+                            "text_snippet": chunk_data.get("text", "")[:150] + "..."
+                        })
+                        unique_chunk_ids_in_context.add(chunk_id)
             elif retrieved_chunks:
-                 reasoning_trace.append(f"Hop {hops_taken}: No new unique chunks added to context (all duplicates/similar).")
+                 reasoning_trace.append(f"Hop {hops_taken}: No new unique chunks added (duplicates/similar).")
 
             full_context_for_reasoning = "\n\n==== CONTEXT FROM HOP/SUMMARY SEPARATOR ====\n\n".join(accumulated_context_list)
-            system_note = "[System Note: Retrieval for the last query failed.]\n\n"
-            context_to_send_reasoner = (system_note + full_context_for_reasoning
-                                        if not retrieval_succeeded_this_hop and hop > 0 # Add note if this hop failed AND not first hop
-                                        else full_context_for_reasoning)
-
+            
             action, value = self._reason_and_refine_query(
                 original_query,
-                context_to_send_reasoner,
-                graph_query_history,
+                full_context_for_reasoning,
+                graph_query_history, # Use graph_query_history for reasoning context
                 hops_taken,
                 retrieval_failed_last=(not retrieval_succeeded_this_hop)
             )
@@ -556,16 +496,18 @@ class CNTRagSystem:
                  next_raw_query = value
                  current_query = self._transform_query(next_raw_query)
                  reasoning_trace.append(f"Hop {hops_taken}: Reasoning -> NEXT_QUERY = '{current_query}'")
+                 # --- FIX: Update both histories ---
                  if not search_query_history or current_query != search_query_history[-1]:
                      search_query_history.append(current_query)
                  if not graph_query_history or current_query != graph_query_history[-1]:
                       graph_query_history.append(current_query)
+                 # ---------------------------------
             else:
                  self.logger.error(f"Reasoning resulted in '{action}': {value}. Stopping multihop.")
                  reasoning_trace.append(f"Hop {hops_taken}: Reasoning -> {action}: {value}. Proceeding to final answer.")
                  break
 
-        if hops_taken == max_hops and action != "ANSWER_COMPLETE": # Check if action was set
+        if hops_taken >= max_hops and action != "ANSWER_COMPLETE":
             self.logger.info("Max hops reached. Proceeding to final answer generation.")
             reasoning_trace.append(f"Max hops ({max_hops}) reached.")
 
@@ -585,8 +527,10 @@ class CNTRagSystem:
                  reasoning_trace.append(f"Evaluation Metrics: {eval_summary}")
 
         formatted_reasoning = format_reasoning_trace(reasoning_trace)
+        
         graph_filename = None
         if generate_graph:
+            # This call will now succeed because graph_query_history is guaranteed to exist
             graph_filename = generate_hop_graph(reasoning_trace, graph_query_history, self.graph_dir, self.logger)
 
         process_end_time = time.time()

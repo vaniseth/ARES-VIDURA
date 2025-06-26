@@ -26,15 +26,10 @@ def load_test_questions(filepath: str) -> List[str]:
         return []
 
 def run_test_query(rag_system: CNTRagSystem, question: str, index: int, user_type: str):
-    """Runs a single test query and prints the results."""
-    # Note: The 'user_type' is now part of CNTRagSystem's initialization,
-    # so we don't need to pass it to process_query explicitly unless
-    # process_query itself needs to behave differently based on it during a single call.
-    # For now, we'll just use it in the print statement.
-    print(f"\n--- Processing Query {index+1} for '{user_type}' user (using {rag_system.llm_interface.llm_provider.upper()} backend) ---")
+    """Runs a single test query and prints the results with detailed sources."""
+    print(f"\n--- Processing Query {index+1} for '{user_type}' user ---")
     print(f"Question: {question}")
 
-    start_time = time.time()
     results = rag_system.process_query(
         question=question,
         top_k=config.DEFAULT_TOP_K,
@@ -43,10 +38,29 @@ def run_test_query(rag_system: CNTRagSystem, question: str, index: int, user_typ
         request_evaluation=True,
         generate_graph=True
     )
-    # end_time = time.time() # This was here, but processing_time_s is in debug_info
 
     print("\n--- Final Answer ---")
     print(results.get("final_answer", "N/A"))
+
+    print("\n--- Detailed Sources Used for Final Context ---")
+    retrieved_sources = results.get("retrieved_sources")
+    if retrieved_sources and isinstance(retrieved_sources, list):
+        if not retrieved_sources:
+            print("No specific sources were successfully retrieved or used for the final context.")
+        else:
+            for i, src_info in enumerate(retrieved_sources):
+                score = src_info.get('retrieval_score', 'N/A')
+                score_str = f"{score:.4f}" if isinstance(score, float) else str(score)
+                print(
+                    f"Source {i+1}: \n"
+                    f"  - Document: '{src_info.get('document_name', 'N/A')}'\n"
+                    f"  - Page: {src_info.get('page_number', 'N/A')}\n"
+                    f"  - Chunk ID: {src_info.get('chunk_id', 'N/A')}\n"
+                    f"  - Retrieval Score: {score_str}\n"
+                    f"  - Snippet: \"{src_info.get('text_snippet', '')}\""
+                )
+    elif retrieved_sources:
+        print(f"Source Information: {retrieved_sources}")
 
     confidence = results.get("confidence_score")
     print("\n--- Confidence Score ---")

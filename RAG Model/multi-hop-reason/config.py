@@ -20,7 +20,7 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY") # Renamed for clarity
 OPENAI_API_KEY = os.getenv("GPT_API_KEY") # Add OpenAI API Key
 
 # --- Model IDs ---
-DEFAULT_GENERATIVE_LLM_PROVIDER = "openai" # "google" or "openai"
+DEFAULT_GENERATIVE_LLM_PROVIDER = "google" # "google" or "openai"
 
 # Google Gemini
 DEFAULT_GOOGLE_MODEL_ID = "gemini-2.0-flash"
@@ -39,7 +39,7 @@ DEFAULT_GRAPH_DIR = "cnt_rag_graphs"
 DEFAULT_TEST_QUESTIONS_PATH = "test_questions.txt" # Path to test questions
 
 # --- Default RAG Settings ---
-DEFAULT_VECTOR_DB_TYPE = "inmemory" # Options: "csv", "chroma", "inmemory"
+DEFAULT_VECTOR_DB_TYPE = "csv" # Options: "csv", "chroma", "inmemory"
 DEFAULT_CHUNK_STRATEGY = "recursive"
 DEFAULT_CHUNK_SIZE = 1500
 DEFAULT_CHUNK_OVERLAP = 200

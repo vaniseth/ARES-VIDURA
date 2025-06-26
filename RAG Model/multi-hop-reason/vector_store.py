@@ -12,6 +12,7 @@ from llm_interface import LLMInterface
 # Assuming data_processing.py contains parse_and_chunk_documents
 from data_processing import parse_and_chunk_documents
 import config # Import config for defaults
+import json
 
 class VectorStore(ABC):
     """Abstract base class for vector stores."""
@@ -23,7 +24,7 @@ class VectorStore(ABC):
     @abstractmethod
     def load_or_build(self,
                       documents_path_pattern: str,
-                      chunk_settings: Dict,
+                      chunk_settings: Dict, # This contains strategy, size, overlap
                       embedding_interface: LLMInterface) -> bool:
         """Loads existing vector data or builds it from documents."""
         pass
@@ -43,16 +44,19 @@ class VectorStore(ABC):
                               embedding_interface: LLMInterface) -> Optional[List[Dict[str, Any]]]:
         """Internal helper to parse, chunk, and embed documents."""
         self.logger.info("Starting internal index build process...")
+
+        # This now calls the simplified PyPDF2-based parser
         all_chunks_info = parse_and_chunk_documents(
             documents_path_pattern=documents_path_pattern,
-            chunk_strategy=chunk_settings.get('strategy', config.DEFAULT_CHUNK_STRATEGY),
+            chunk_strategy=chunk_settings.get('strategy', 'recursive'), # Will be 'recursive'
             chunk_size=chunk_settings.get('size', config.DEFAULT_CHUNK_SIZE),
             chunk_overlap=chunk_settings.get('overlap', config.DEFAULT_CHUNK_OVERLAP),
-            min_chunk_length=config.MIN_CHUNK_LENGTH,
-            logger=self.logger
+            embedding_interface=embedding_interface,
+            logger_parent=self.logger
         )
+
         if not all_chunks_info:
-            self.logger.error("No chunks extracted. Index build failed.")
+            self.logger.error("No chunks extracted from documents. Index build failed.")
             return None
 
         chunk_texts = [info["chunk_text"] for info in all_chunks_info]
@@ -63,20 +67,24 @@ class VectorStore(ABC):
 
         processed_chunks_data = []
         failed_embeddings = 0
+
         for i, chunk_info in enumerate(all_chunks_info):
             if i < len(all_embeddings) and all_embeddings[i] is not None and len(all_embeddings[i]) > 0:
                 processed_chunks_data.append({**chunk_info, "embeddings": all_embeddings[i]})
             else:
                 failed_embeddings += 1
-                self.logger.warning(f"Failed embedding for chunk {i} from {chunk_info.get('document_name', 'N/A')}. Skipping.")
+                metadata = chunk_info.get('metadata', {})
+                self.logger.warning(f"Failed to get valid embedding for chunk {metadata.get('chunk_id', 'N/A')}. Skipping.")
 
         if not processed_chunks_data:
-            self.logger.error("No chunks successfully embedded. Index build failed.")
+            self.logger.error("No chunks were successfully embedded. Index build failed.")
             return None
 
-        self.logger.info(f"Successfully embedded {len(processed_chunks_data)} chunks ({failed_embeddings} failures).")
-        return processed_chunks_data
+        self.logger.info(f"Successfully embedded {len(processed_chunks_data)} chunks.")
+        if failed_embeddings > 0:
+            self.logger.warning(f"Failed to embed {failed_embeddings} chunks.")
 
+        return processed_chunks_data
 
 # --- CSV/InMemory Implementation ---
 class PandasVectorStore(VectorStore):
@@ -91,164 +99,170 @@ class PandasVectorStore(VectorStore):
              raise ValueError("db_path must be provided for CSVVectorStore")
 
     def _save_dataframe_to_csv(self):
-        """Saves the DataFrame to CSV."""
         if self.in_memory or not self.db_path or self.vector_db_df is None or self.vector_db_df.empty:
             return
         try:
             self.logger.info(f"Saving vector database DataFrame to {self.db_path}...")
-            df_copy = self.vector_db_df.copy()
-            # Convert numpy arrays to lists for CSV
-            if 'embeddings' in df_copy.columns and isinstance(df_copy['embeddings'].iloc[0], np.ndarray):
-                df_copy['embeddings'] = df_copy['embeddings'].apply(lambda x: x.tolist() if isinstance(x, np.ndarray) else [])
+            df_to_save = self.vector_db_df.copy()
+
+            if 'embeddings' in df_to_save.columns and not df_to_save.empty and isinstance(df_to_save['embeddings'].iloc[0], np.ndarray):
+                df_to_save['embeddings_list_str'] = df_to_save['embeddings'].apply(lambda x: json.dumps(x.tolist()) if isinstance(x, np.ndarray) else json.dumps([]))
+            elif 'embeddings' in df_to_save.columns: # Fallback if not ndarray but present
+                 df_to_save['embeddings_list_str'] = df_to_save['embeddings'].apply(lambda x: json.dumps(list(x)) if hasattr(x, '__iter__') else json.dumps([]))
+            else:
+                df_to_save['embeddings_list_str'] = pd.Series([json.dumps([]) for _ in range(len(df_to_save))])
+
+
+            if 'metadata' in df_to_save.columns and not df_to_save.empty:
+                df_to_save['metadata_json_str'] = df_to_save['metadata'].apply(lambda x: json.dumps(x) if isinstance(x, dict) else json.dumps({}))
+            else:
+                df_to_save['metadata_json_str'] = pd.Series([json.dumps({}) for _ in range(len(df_to_save))])
+
+
+            columns_to_save = ['chunk_text', 'embeddings_list_str', 'metadata_json_str']
+            final_columns = [col for col in columns_to_save if col in df_to_save.columns]
+            if 'chunk_text' not in final_columns:
+                self.logger.error("Cannot save DataFrame: 'chunk_text' column is missing.")
+                return
 
             dir_name = os.path.dirname(self.db_path)
             if dir_name and not os.path.exists(dir_name):
                 os.makedirs(dir_name)
-            df_copy.to_csv(self.db_path, index=False)
-            self.logger.info(f"DataFrame successfully saved to {self.db_path}")
+            df_to_save[final_columns].to_csv(self.db_path, index=False)
+            self.logger.info(f"DataFrame successfully saved to {self.db_path} with columns: {final_columns}")
         except Exception as e:
             self.logger.exception(f"Error saving DataFrame to CSV at {self.db_path}: {e}")
 
     def _load_dataframe_from_csv(self) -> bool:
-        """Loads the DataFrame from CSV."""
         if not self.db_path or not os.path.exists(self.db_path):
             return False
         try:
             self.logger.info(f"Loading vector database from {self.db_path}...")
             self.vector_db_df = pd.read_csv(self.db_path)
-            if 'embeddings' in self.vector_db_df.columns and not self.vector_db_df.empty:
-                first_emb = self.vector_db_df['embeddings'].iloc[0]
-                if isinstance(first_emb, str):
-                    self.logger.info("Converting string embeddings in CSV to numpy arrays...")
-                    self.vector_db_df['embeddings'] = self.vector_db_df['embeddings'].apply(
-                        lambda x: np.array(list(map(float, re.findall(r"-?\d+\.?\d*", x)))) if isinstance(x, str) and x else np.array([])
-                    )
-                elif isinstance(first_emb, list):
-                    self.vector_db_df['embeddings'] = self.vector_db_df['embeddings'].apply(np.array)
-
-                # Validate embeddings
-                valid_embeddings = self.vector_db_df['embeddings'].apply(lambda x: isinstance(x, np.ndarray) and x.size > 0)
-                if valid_embeddings.any():
-                    self.logger.info(f"Vector database loaded successfully. Shape: {self.vector_db_df.shape}")
-                    self._is_ready = True
-                    return True
-                else:
-                     self.logger.warning("CSV loaded but contains no valid embeddings after conversion.")
-                     self.vector_db_df = None
-                     return False
-            elif self.vector_db_df.empty:
-                 self.logger.warning(f"Loaded CSV file '{self.db_path}' is empty.")
-                 self.vector_db_df = None
-                 return False
-            else:
-                self.logger.error(f"CSV file '{self.db_path}' is missing the 'embeddings' column.")
-                self.vector_db_df = None
-                return False
+            
+            # Convert strings back to numpy arrays and dicts
+            self.vector_db_df['embeddings'] = self.vector_db_df['embeddings_str'].apply(lambda x: np.array(json.loads(x)))
+            self.vector_db_df['metadata'] = self.vector_db_df['metadata_str'].apply(lambda x: json.loads(x))
+            
+            self.vector_db_df.drop(columns=['embeddings_str', 'metadata_str'], inplace=True)
+            
+            self.logger.info(f"Vector database loaded successfully. Shape: {self.vector_db_df.shape}")
+            self._is_ready = True
+            return True
         except Exception as e:
-            self.logger.exception(f"An unexpected error occurred during CSV DB loading: {e}")
-            self.vector_db_df = None
-            return False
+            self.logger.exception(f"Unexpected error during CSV DB loading: {e}"); self.vector_db_df = None; return False
+
 
     def load_or_build(self,
                       documents_path_pattern: str,
                       chunk_settings: Dict,
                       embedding_interface: LLMInterface) -> bool:
-        """Loads or builds the CSV/InMemory database."""
         loaded = False
-        if not self.in_memory:
-             loaded = self._load_dataframe_from_csv()
+        if not self.in_memory: loaded = self._load_dataframe_from_csv()
+        if loaded: self.logger.info("Successfully loaded existing vector data."); self._is_ready = True; return True
+        
+        if self.in_memory and self.db_path and os.path.exists(self.db_path):
+             if self._load_dataframe_from_csv(): self.logger.info("Successfully loaded vector data into memory from CSV."); self._is_ready = True; return True
+             else: self.logger.info("Failed to load from CSV for in-memory store, proceeding to build.")
 
-        if loaded:
-             self.logger.info("Successfully loaded existing vector data.")
-             self._is_ready = True
-             return True
-        elif self.in_memory and self.db_path and os.path.exists(self.db_path):
-             # In-memory case: try loading from CSV first if it exists
-             if self._load_dataframe_from_csv():
-                  self.logger.info("Successfully loaded existing vector data into memory from CSV.")
-                  self._is_ready = True
-                  return True
-             else:
-                  self.logger.info("Failed to load from CSV for in-memory store, proceeding to build.")
+        self.logger.info("Building new vector index...")
+        # _build_index_internal now returns List[{"chunk_text":..., "metadata":..., "embeddings":...}]
+        processed_chunks_with_embeddings = self._build_index_internal(documents_path_pattern, chunk_settings, embedding_interface)
 
+        if processed_chunks_with_embeddings:
+            df_data_list = []
+            for chunk in processed_chunks_with_embeddings:
+                # Ensure all keys are present, provide defaults if not (though they should be)
+                df_data_list.append({
+                    "chunk_text": chunk.get("chunk_text", ""),
+                    "embeddings": np.array(chunk.get("embeddings", [])), # Ensure numpy array
+                    "metadata": chunk.get("metadata", {}) # This is the rich dict
+                })
+            
+            self.vector_db_df = pd.DataFrame(df_data_list)
+            if self.vector_db_df.empty and processed_chunks_with_embeddings: # Should not happen if data was processed
+                self.logger.error("DataFrame is empty after processing chunks. Check data integrity.")
+                self._is_ready = False; return False
 
-        # Build if not loaded or if in-memory without existing CSV
-        self.logger.info("Existing data not found or invalid. Building index...")
-        processed_chunks = self._build_index_internal(documents_path_pattern, chunk_settings, embedding_interface)
-
-        if processed_chunks:
-            self.vector_db_df = pd.DataFrame(processed_chunks)
-            # Ensure embeddings are numpy arrays for querying
-            self.vector_db_df['embeddings'] = self.vector_db_df['embeddings'].apply(np.array)
-            self.logger.info(f"Index built successfully. Shape: {self.vector_db_df.shape}")
+            self.logger.info(f"Index built successfully. DataFrame shape: {self.vector_db_df.shape}")
             self._is_ready = True
-            if not self.in_memory:
-                self._save_dataframe_to_csv() # Save if CSV type
-            elif self.db_path:
-                 # Optionally save even for in-memory if path provided
-                 self.logger.info("Saving newly built in-memory index to CSV for future use.")
-                 self._save_dataframe_to_csv()
+            if not self.in_memory or (self.in_memory and self.db_path): # Save if CSV type OR if in-memory but path provided (for caching)
+                self._save_dataframe_to_csv()
             return True
         else:
-            self.logger.error("Failed to build index.")
+            self.logger.error("Failed to build index (no processed chunks with embeddings).")
             self._is_ready = False
             return False
 
     def query(self, query_embedding: List[float], top_k: int) -> List[Dict[str, Any]]:
-        """Retrieves relevant chunks from the DataFrame."""
+        """
+        Queries the Pandas DataFrame for top_k most relevant chunks.
+        """
         if not self.is_ready() or self.vector_db_df is None or self.vector_db_df.empty:
-            self.logger.warning("Pandas vector store is not ready or empty.")
+            self.logger.warning("Pandas vector store is not ready or is empty. Returning no results.")
+            return []
+        
+        required_cols = ['embeddings', 'metadata', 'chunk_text']
+        if not all(col in self.vector_db_df.columns for col in required_cols):
+            self.logger.error(f"DataFrame is missing one or more required columns {required_cols}. Cannot query.")
             return []
 
-        query_embedding_2d = np.array([query_embedding])
-        is_valid_embedding = self.vector_db_df['embeddings'].apply(lambda x: isinstance(x, np.ndarray) and x.size > 0)
-        valid_df = self.vector_db_df[is_valid_embedding]
+        # --- Vectorized Similarity Calculation for Performance ---
+        query_embedding_np = np.array(query_embedding).reshape(1, -1)
+        
+        # Filter out rows with invalid embeddings to prevent errors
+        valid_embeddings_mask = self.vector_db_df['embeddings'].apply(
+            lambda x: isinstance(x, np.ndarray) and x.ndim == 1 and x.shape[0] == query_embedding_np.shape[1]
+        )
+        valid_df = self.vector_db_df[valid_embeddings_mask]
 
         if valid_df.empty:
-             self.logger.error("No valid numpy array embeddings found in DataFrame.")
-             return []
-
+            self.logger.warning("No valid/matching dimension embeddings found in DataFrame for querying.")
+            return []
+            
         try:
+            # Stack all valid embeddings into a single numpy matrix
             database_embeddings = np.stack(valid_df["embeddings"].to_numpy())
-            if database_embeddings.shape[1] != query_embedding_2d.shape[1]:
-                self.logger.error(f"Embedding dimension mismatch: Query ({query_embedding_2d.shape[1]}) vs DB ({database_embeddings.shape[1]})")
-                return []
         except Exception as stack_err:
-            self.logger.error(f"Error stacking database embeddings: {stack_err}.")
+            self.logger.error(f"Error stacking database embeddings, likely due to inconsistent shapes: {stack_err}")
             return []
+            
+        # Calculate cosine similarities in one go
+        similarities = cosine_similarity(query_embedding_np, database_embeddings)[0]
 
-        try:
-            similarities = cosine_similarity(query_embedding_2d, database_embeddings)[0]
-        except Exception as sim_err:
-            self.logger.error(f"Error calculating cosine similarity: {sim_err}")
-            return []
-
+        # Get top_k indices from the *similarities* array (which corresponds to valid_df)
         actual_top_k = min(top_k, len(similarities))
-        if actual_top_k <= 0: return []
+        if actual_top_k <= 0:
+            return []
+        
+        top_indices_in_filtered_df = np.argsort(similarities)[-actual_top_k:][::-1] # Most similar first
 
-        top_indices_local = np.argsort(similarities)[-actual_top_k:][::-1]
-        top_original_indices = valid_df.index[top_indices_local]
-
+        # Get the corresponding rows from the valid DataFrame
+        relevant_rows = valid_df.iloc[top_indices_in_filtered_df]
+        
+        # --- Format Results ---
         results = []
-        relevant_rows = self.vector_db_df.loc[top_original_indices]
-        for i, (original_idx, row) in enumerate(relevant_rows.iterrows()):
-            similarity_score = similarities[top_indices_local[i]]
+        for i, (_, row) in enumerate(relevant_rows.iterrows()):
+            # The score is from the sorted similarities array
+            score = similarities[top_indices_in_filtered_df[i]]
+            
+            chunk_metadata = row.get('metadata', {})
+            # Ensure metadata is a dict, not a string, if loaded from CSV incorrectly
+            if isinstance(chunk_metadata, str):
+                try: chunk_metadata = json.loads(chunk_metadata)
+                except json.JSONDecodeError: chunk_metadata = {}
+            
             results.append({
-                 "id": f"chunk_{original_idx}",
-                 "text": row['chunk_text'],
-                 "metadata": {
-                     "document_name": row.get('document_name', 'Unknown'),
-                     "page_number": int(row.get('page_number', -1)),
-                     "chunk_number": int(row.get('chunk_number', -1)),
-                 },
-                 "score": float(similarity_score)
-             })
+                 "id": chunk_metadata.get("chunk_id", f"df_idx_{row.name}"), # Use df index as fallback id
+                 "text": row.get('chunk_text', ""),
+                 "metadata": chunk_metadata, # This is the detailed dict
+                 "score": float(score)
+            })
+            
         return results
-
 # --- ChromaDB Implementation ---
 class ChromaVectorStore(VectorStore):
     """Vector store using ChromaDB."""
-
     def __init__(self, collection_name: str = "cnt_collection", persist_directory: Optional[str] = None, logger: logging.Logger = logging.getLogger("CNTRAG")):
         super().__init__(logger)
         self.collection_name = collection_name
@@ -260,197 +274,138 @@ class ChromaVectorStore(VectorStore):
     def _initialize_chroma_client(self):
         try:
             import chromadb
-            from chromadb.config import Settings
-
-            client_settings = Settings()
+            # from chromadb.config import Settings # Older versions might need this
+            client_settings = {}
             if self.persist_directory:
                 os.makedirs(self.persist_directory, exist_ok=True)
-                client_settings = Settings(persist_directory=self.persist_directory, is_persistent=True) # Correct way for persistence
+                # For newer chromadb versions, persistence is handled by passing path to client
+                self.chroma_client = chromadb.PersistentClient(path=self.persist_directory)
                 self.logger.info(f"Initializing ChromaDB with persistence at: {self.persist_directory}")
             else:
+                 self.chroma_client = chromadb.Client() # In-memory client
                  self.logger.info("Initializing ChromaDB in-memory.")
 
-
-            self.chroma_client = chromadb.Client(client_settings)
             self.collection = self.chroma_client.get_or_create_collection(
                 name=self.collection_name,
-                metadata={"hnsw:space": "cosine"} # Explicitly use cosine distance
+                metadata={"hnsw:space": "cosine"}
             )
             self.logger.info(f"ChromaDB client connected. Using collection: '{self.collection_name}'")
-            # Check initial count to help determine if build is needed
-            try:
-                if self.collection.count() > 0:
-                    self.logger.info(f"Chroma collection '{self.collection_name}' already contains {self.collection.count()} documents.")
-                    self._is_ready = True # Assume ready if count > 0
-            except Exception as count_err:
-                 self.logger.warning(f"Could not get initial count from Chroma: {count_err}")
+            if self.collection.count() > 0: self.logger.info(f"Chroma collection already contains {self.collection.count()} documents."); self._is_ready = True
+        except ImportError: self.logger.error("ChromaDB library not installed. pip install chromadb"); raise
+        except Exception as e: self.logger.exception(f"ChromaDB setup error: {e}"); raise
+
+    def _populate_chroma(self, processed_chunks_with_embeddings: List[Dict[str, Any]]):
+        if not self.collection or not processed_chunks_with_embeddings: self.logger.warning("Chroma collection not init or no chunks."); return False
+        
+        ids, embeddings_list, documents_list, metadatas_list = [], [], [], []
+        embedding_dim = None
+
+        for i, chunk_data in enumerate(processed_chunks_with_embeddings):
+            current_embedding = chunk_data.get('embeddings')
+            if current_embedding and chunk_data.get('chunk_text') and isinstance(current_embedding, list) and len(current_embedding) > 0:
+                if embedding_dim is None: embedding_dim = len(current_embedding)
+                elif len(current_embedding) != embedding_dim:
+                    self.logger.warning(f"Inconsistent embedding dimension in batch for Chroma: expected {embedding_dim}, got {len(current_embedding)} for chunk_id {chunk_data.get('metadata', {}).get('chunk_id')}. Skipping.")
+                    continue
+
+                ids.append(chunk_data.get('metadata', {}).get('chunk_id', f"auto_id_{i}"))
+                embeddings_list.append(current_embedding) # Should be list of floats
+                documents_list.append(chunk_data['chunk_text'])
+                metadatas_list.append(chunk_data['metadata']) # Pass the full metadata dict
+            else:
+                self.logger.warning(f"Skipping chunk for Chroma due to missing text, embedding, or invalid embedding: id {chunk_data.get('metadata', {}).get('chunk_id')}")
 
 
-        except ImportError:
-            self.logger.error("ChromaDB library not installed. Please run 'pip install chromadb'")
-            raise # Re-raise to indicate failure
-        except Exception as e:
-            self.logger.exception(f"An unexpected error occurred during ChromaDB setup: {e}")
-            raise # Re-raise
-
-    def _populate_chroma(self, processed_chunks: List[Dict[str, Any]]):
-        """Adds processed chunks (with embeddings) to the Chroma collection."""
-        if not self.collection or not processed_chunks:
-            self.logger.warning("Chroma collection not initialized or no chunks to populate.")
-            return False
-
-        ids = []
-        embeddings = []
-        documents = []
-        metadatas = []
-
-        for i, chunk_data in enumerate(processed_chunks):
-            if chunk_data.get('embeddings') and chunk_data.get('chunk_text'):
-                 ids.append(f"chunk_{i}_{chunk_data.get('document_name', 'doc')[:10]}") # More unique ID
-                 embeddings.append(chunk_data['embeddings'])
-                 documents.append(chunk_data['chunk_text'])
-                 metadatas.append({
-                     "document_name": chunk_data.get('document_name', 'Unknown'),
-                     "page_number": int(chunk_data.get('page_number', -1)),
-                     "chunk_number": int(chunk_data.get('chunk_number', -1)),
-                 })
-
-        if not ids:
-            self.logger.warning("No valid chunks found to add to ChromaDB.")
-            return False
-
-        batch_size = 100
-        total_added = 0
+        if not ids: self.logger.warning("No valid chunks found to add to ChromaDB."); return False
+        
+        batch_size = 100; total_added = 0
         try:
             for i in range(0, len(ids), batch_size):
                 batch_ids = ids[i:i+batch_size]
-                batch_embeddings = embeddings[i:i+batch_size]
-                batch_documents = documents[i:i+batch_size]
-                batch_metadatas = metadatas[i:i+batch_size]
-
                 if not batch_ids: continue
-
                 self.collection.add(
                     ids=batch_ids,
-                    embeddings=batch_embeddings,
-                    documents=batch_documents,
-                    metadatas=batch_metadatas
+                    embeddings=embeddings_list[i:i+batch_size],
+                    documents=documents_list[i:i+batch_size],
+                    metadatas=metadatas_list[i:i+batch_size]
                 )
                 total_added += len(batch_ids)
-                self.logger.info(f"Added batch {i//batch_size + 1} ({len(batch_ids)} docs) to ChromaDB. Total added: {total_added}")
-
-            # Optional: Persist changes if using disk-based Chroma
-            if self.persist_directory:
-                 self.logger.info("Persisting ChromaDB changes...")
-                 # Chroma client with `is_persistent=True` handles persistence automatically on add/delete etc.
-                 # Explicit persist call isn't usually needed with the Settings approach.
-                 # If using older chromadb versions or manual persistence:
-                 # self.chroma_client.persist()
-                 pass
-
-
+                self.logger.info(f"Added batch {i//batch_size + 1} ({len(batch_ids)} docs) to ChromaDB. Total: {total_added}")
             self.logger.info(f"Finished populating ChromaDB. Added {total_added} documents.")
             return True
-        except Exception as batch_err:
-            self.logger.exception(f"Error adding batch to ChromaDB: {batch_err}. Population may be incomplete.")
-            return False
+        except Exception as batch_err: self.logger.exception(f"Error adding batch to ChromaDB: {batch_err}"); return False
 
+    def load_or_build(self, documents_path_pattern: str, chunk_settings: Dict, embedding_interface: LLMInterface) -> bool:
+        if not self.collection: self.logger.error("ChromaDB collection not initialized."); return False
+        if self.collection.count() > 0: self.logger.info(f"ChromaDB collection already has {self.collection.count()} docs."); self._is_ready = True; return True
 
-    def load_or_build(self,
-                      documents_path_pattern: str,
-                      chunk_settings: Dict,
-                      embedding_interface: LLMInterface) -> bool:
-        """Builds the ChromaDB index if it's empty."""
-        if not self.collection:
-             self.logger.error("ChromaDB collection not initialized. Cannot load or build.")
-             return False
-
-        try:
-            # Check count again, might have been populated after init
-            current_count = self.collection.count()
-            if current_count > 0:
-                self.logger.info(f"ChromaDB collection '{self.collection_name}' already has {current_count} documents. Assuming loaded.")
-                self._is_ready = True
-                return True
-        except Exception as count_err:
-            self.logger.warning(f"Could not verify ChromaDB count: {count_err}. Attempting build if necessary.")
-
-
-        self.logger.info(f"ChromaDB collection '{self.collection_name}' appears empty. Building index...")
-        processed_chunks = self._build_index_internal(documents_path_pattern, chunk_settings, embedding_interface)
-
-        if processed_chunks:
-             populated = self._populate_chroma(processed_chunks)
+        self.logger.info(f"ChromaDB collection '{self.collection_name}' empty. Building index...")
+        processed_chunks_with_embeddings = self._build_index_internal(documents_path_pattern, chunk_settings, embedding_interface)
+        if processed_chunks_with_embeddings:
+             populated = self._populate_chroma(processed_chunks_with_embeddings)
              self._is_ready = populated
              return populated
-        else:
-            self.logger.error("Failed to build index (no processed chunks).")
-            self._is_ready = False
-            return False
+        else: self.logger.error("Failed to build index (no processed chunks)."); self._is_ready = False; return False
 
     def query(self, query_embedding: List[float], top_k: int) -> List[Dict[str, Any]]:
-        """Queries the ChromaDB collection."""
+        """Queries the ChromaDB collection for top_k most relevant chunks."""
         if not self.is_ready() or not self.collection:
-            self.logger.warning("ChromaDB collection is not ready or not initialized.")
+            self.logger.warning("ChromaDB not ready or collection not initialized.")
             return []
         try:
             results = self.collection.query(
-                query_embeddings=[query_embedding],
-                n_results=top_k,
-                include=["documents", "metadatas", "distances"] # Request distances
+                query_embeddings=[query_embedding], 
+                n_results=top_k, 
+                include=["documents", "metadatas", "distances"]
             )
-
+            
             if not results or not results.get("ids") or not results["ids"][0]:
-                self.logger.debug("No relevant chunks found in ChromaDB.")
+                self.logger.debug("No chunks returned from ChromaDB query.")
                 return []
-
+            
+            # --- Format Results Consistently ---
             formatted_results = []
-            ids = results["ids"][0]
-            distances = results.get("distances", [[]])[0]
-            documents = results.get("documents", [[]])[0]
-            metadatas = results.get("metadatas", [[]])[0]
-
-            for i, chunk_id in enumerate(ids):
-                if i < len(distances) and i < len(documents) and i < len(metadatas):
-                     distance = distances[i]
-                     # Similarity for cosine distance: 1 - distance
-                     # Similarity for L2 distance: depends, maybe exp(-distance) or 1 / (1 + distance)
-                     # Assuming cosine space as configured
-                     similarity_score = 1.0 - distance
-
-                     formatted_results.append({
-                         "id": chunk_id,
-                         "text": documents[i],
-                         "metadata": metadatas[i] if metadatas[i] else {},
-                         "score": float(similarity_score)
-                     })
+            res_ids = results["ids"][0]
+            res_distances = results.get("distances", [[]])[0]
+            res_documents = results.get("documents", [[]])[0]
+            res_metadatas = results.get("metadatas", [[]])[0]
+            
+            for i, chunk_id in enumerate(res_ids):
+                # Ensure all result lists are long enough to avoid IndexError
+                if i < len(res_documents) and i < len(res_metadatas) and i < len(res_distances):
+                    # For cosine distance: similarity = 1 - distance
+                    similarity_score = 1.0 - res_distances[i]
+                    
+                    metadata_dict = res_metadatas[i] or {}
+                    
+                    formatted_results.append({
+                        "id": chunk_id,
+                        "text": res_documents[i],
+                        "metadata": metadata_dict,
+                        "score": float(similarity_score)
+                    })
                 else:
-                    self.logger.warning(f"Inconsistent result lengths from ChromaDB query. Skipping partial result at index {i}.")
-
+                    self.logger.warning(f"Inconsistent result lengths from ChromaDB at index {i}. Skipping this result.")
+            
             return formatted_results
-
         except Exception as e:
-            self.logger.exception(f"Error querying ChromaDB: {e}")
+            self.logger.exception(f"An unexpected error occurred while querying ChromaDB: {e}")
             return []
+
 
 # --- Factory Function ---
 def get_vector_store(vector_db_type: str, vector_db_path: Optional[str], logger: logging.Logger) -> VectorStore:
-    """Factory function to create the appropriate vector store instance."""
     db_type = vector_db_type.lower()
     if db_type == "csv":
         logger.info("Creating CSV Vector Store")
-        if not vector_db_path:
-            raise ValueError("vector_db_path is required for CSV vector store.")
+        if not vector_db_path: raise ValueError("vector_db_path is required for CSV vector store.")
         return PandasVectorStore(db_path=vector_db_path, in_memory=False, logger=logger)
     elif db_type == "inmemory":
         logger.info("Creating InMemory Vector Store")
-        # Allow path for potential loading/saving cache even if in-memory
         return PandasVectorStore(db_path=vector_db_path, in_memory=True, logger=logger)
     elif db_type == "chroma":
         logger.info("Creating ChromaDB Vector Store")
-        # Use path as persist directory if provided, otherwise in-memory
         persist_dir = vector_db_path if vector_db_path else None
-        # Can customize collection name if needed
         return ChromaVectorStore(persist_directory=persist_dir, logger=logger)
     else:
         raise ValueError(f"Unknown vector database type: {vector_db_type}")
