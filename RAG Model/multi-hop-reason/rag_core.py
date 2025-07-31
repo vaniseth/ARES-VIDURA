@@ -67,6 +67,48 @@ class CNTRagSystem:
         if transformed_query != query:
             self.logger.info(f"Query transformed: '{query}' -> '{transformed_query}'")
         return transformed_query
+    
+    def generate_contextual_query(self, chat_history: List[Dict[str, Any]], new_question: str) -> str:
+        """
+        Generates a standalone query from the chat history and the new question.
+        """
+        self.logger.info("Generating standalone query from chat history...")
+        
+        # If history is empty or this is the first real question, no need to rephrase
+        if len(chat_history) <= 1:
+            self.logger.info("No significant history found. Using new question as is.")
+            return new_question
+
+        # Format the chat history for the prompt
+        formatted_history = ""
+        for message in chat_history[:-1]: # Exclude the latest question
+            role = "User" if message["role"] == "user" else "Assistant"
+            formatted_history += f"{role}: {message['content']}\n"
+        
+        prompt = f"""Given the following chat history and a new question, rephrase the new question to be a standalone question that can be understood without the preceding context.
+        If the new question is already a complete, standalone question, you can return it as is.
+        Do not answer the question, just reformulate it.
+
+        **Chat History:**
+        {formatted_history}
+
+        **New Question:**
+        "{new_question}"
+
+        **Standalone Question:**
+        """
+        
+        rephrased_query = self.llm_interface.generate_response(prompt)
+
+        if rephrased_query.startswith("LLM_ERROR"):
+            self.logger.warning(f"Failed to rephrase query due to LLM error: {rephrased_query}. Using original question.")
+            return new_question
+        
+        # Simple cleanup of the LLM's output
+        rephrased_query = rephrased_query.strip().strip('"')
+
+        self.logger.info(f"Original question: '{new_question}' -> Standalone question: '{rephrased_query}'")
+        return rephrased_query
 
     def _expand_query(self, query: str, num_expansions: int = 2) -> List[str]:
         """Generate query variations using the LLM based on user type."""
