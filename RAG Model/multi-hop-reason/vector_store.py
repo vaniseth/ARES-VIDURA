@@ -1,6 +1,7 @@
 import os
 import re
 import logging
+import chromadb
 import pandas as pd
 import numpy as np
 from abc import ABC, abstractmethod
@@ -14,6 +15,8 @@ from data_processing import parse_and_chunk_documents
 import config # Import config for defaults
 import json
 
+from graph_db import Neo4jGraphDB # Import the graph DB class
+
 class VectorStore(ABC):
     """Abstract base class for vector stores."""
 
@@ -24,8 +27,9 @@ class VectorStore(ABC):
     @abstractmethod
     def load_or_build(self,
                       documents_path_pattern: str,
-                      chunk_settings: Dict, # This contains strategy, size, overlap
-                      embedding_interface: LLMInterface) -> bool:
+                      chunk_settings: Dict,
+                      embedding_interface: LLMInterface,
+                      graph_db: Neo4jGraphDB) -> bool: # Add graph_db parameter
         """Loads existing vector data or builds it from documents."""
         pass
 
@@ -41,17 +45,19 @@ class VectorStore(ABC):
     def _build_index_internal(self,
                               documents_path_pattern: str,
                               chunk_settings: Dict,
-                              embedding_interface: LLMInterface) -> Optional[List[Dict[str, Any]]]:
-        """Internal helper to parse, chunk, and embed documents."""
-        self.logger.info("Starting internal index build process...")
+                              embedding_interface: LLMInterface,
+                              graph_db: Neo4jGraphDB) -> Optional[List[Dict[str, Any]]]: # Add graph_db parameter
+        """Internal helper to parse, chunk, embed documents, and populate KG."""
+        self.logger.info("Starting internal index build process (including KG population)...")
 
         # This now calls the simplified PyPDF2-based parser
         all_chunks_info = parse_and_chunk_documents(
             documents_path_pattern=documents_path_pattern,
-            chunk_strategy=chunk_settings.get('strategy', 'recursive'), # Will be 'recursive'
+            chunk_strategy=chunk_settings.get('strategy', 'recursive'),
             chunk_size=chunk_settings.get('size', config.DEFAULT_CHUNK_SIZE),
             chunk_overlap=chunk_settings.get('overlap', config.DEFAULT_CHUNK_OVERLAP),
             embedding_interface=embedding_interface,
+            graph_db=graph_db, # Pass the graph_db object
             logger_parent=self.logger
         )
 
@@ -156,7 +162,8 @@ class PandasVectorStore(VectorStore):
     def load_or_build(self,
                       documents_path_pattern: str,
                       chunk_settings: Dict,
-                      embedding_interface: LLMInterface) -> bool:
+                      embedding_interface: LLMInterface,
+                      graph_db: Neo4jGraphDB) -> bool:
         loaded = False
         if not self.in_memory: loaded = self._load_dataframe_from_csv()
         if loaded: self.logger.info("Successfully loaded existing vector data."); self._is_ready = True; return True
@@ -167,7 +174,7 @@ class PandasVectorStore(VectorStore):
 
         self.logger.info("Building new vector index...")
         # _build_index_internal now returns List[{"chunk_text":..., "metadata":..., "embeddings":...}]
-        processed_chunks_with_embeddings = self._build_index_internal(documents_path_pattern, chunk_settings, embedding_interface)
+        processed_chunks_with_embeddings = self._build_index_internal(documents_path_pattern, chunk_settings, embedding_interface, graph_db)
 
         if processed_chunks_with_embeddings:
             df_data_list = []
@@ -273,7 +280,6 @@ class ChromaVectorStore(VectorStore):
 
     def _initialize_chroma_client(self):
         try:
-            import chromadb
             # from chromadb.config import Settings # Older versions might need this
             client_settings = {}
             if self.persist_directory:
@@ -335,12 +341,16 @@ class ChromaVectorStore(VectorStore):
             return True
         except Exception as batch_err: self.logger.exception(f"Error adding batch to ChromaDB: {batch_err}"); return False
 
-    def load_or_build(self, documents_path_pattern: str, chunk_settings: Dict, embedding_interface: LLMInterface) -> bool:
+    def load_or_build(self,
+                    documents_path_pattern: str,
+                    chunk_settings: Dict,
+                    embedding_interface: LLMInterface,
+                    graph_db: Neo4jGraphDB) -> bool: # Add graph_db
         if not self.collection: self.logger.error("ChromaDB collection not initialized."); return False
         if self.collection.count() > 0: self.logger.info(f"ChromaDB collection already has {self.collection.count()} docs."); self._is_ready = True; return True
 
         self.logger.info(f"ChromaDB collection '{self.collection_name}' empty. Building index...")
-        processed_chunks_with_embeddings = self._build_index_internal(documents_path_pattern, chunk_settings, embedding_interface)
+        processed_chunks_with_embeddings = self._build_index_internal(documents_path_pattern, chunk_settings, embedding_interface, graph_db)
         if processed_chunks_with_embeddings:
              populated = self._populate_chroma(processed_chunks_with_embeddings)
              self._is_ready = populated

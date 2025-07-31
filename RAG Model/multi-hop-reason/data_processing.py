@@ -1,6 +1,8 @@
 # data_processing.py
 import os
 import glob
+import json
+import PyPDF2
 import logging
 import hashlib
 from typing import List, Optional, Dict, Any, Tuple
@@ -9,6 +11,8 @@ import PyPDF2
 import config
 
 
+# Import the new graph DB class
+from graph_db import Neo4jGraphDB
 from llm_interface import LLMInterface
 
 logger = logging.getLogger("CNTRAG_DataProcessing")
@@ -62,23 +66,74 @@ def _elements_to_dicts(elements: List[Any], doc_name: str, doc_path: str) -> Lis
             })
     return extracted_data
 
+# --- NEW FUNCTION: To extract entities using an LLM ---
+def _extract_entities_from_chunk(chunk_text: str, llm_interface: LLMInterface) -> List[Dict[str, str]]:
+    """
+    Uses an LLM to extract key scientific entities from a text chunk.
+    """
+    prompt = f"""
+    From the following scientific text about Carbon Nanotubes, extract key entities.
+    The entity types to extract are: "Method", "Catalyst", "Substrate", "CNT_Type", "Carbon_Source".
+    - "Method": e.g., 'CVD', 'Laser Ablation', 'Arc Discharge', 'Plasma Enhanced CVD', 'Fixed Catalyst', 'Floating Catalyst'
+    - "Catalyst": e.g., 'Iron', 'Nickel', 'Fe', 'Ni', 'Gadolinium'
+    - "Substrate": e.g., 'Silicon', 'Graphite', 'Alumina', 'Magnesium Aluminate'
+    - "CNT_Type": e.g., 'SWCNT', 'MWCNT', 'Single-walled', 'Multi-walled'
+    - "Carbon_Source": e.g., 'Acetylene', 'Methane', 'Ethylene', 'C2H2', 'C2H4'
 
+    Return the results as a JSON list of objects, where each object has a "type" and "name".
+    If no entities are found, return an empty list [].
+
+    Example:
+    Text: "We grew MWCNTs on a silicon substrate using a fixed iron catalyst via the CVD method with acetylene gas."
+    Output:
+    [
+        {{"type": "CNT_Type", "name": "MWCNT"}},
+        {{"type": "Substrate", "name": "Silicon"}},
+        {{"type": "Catalyst", "name": "Iron"}},
+        {{"type": "Method", "name": "Fixed Catalyst"}},
+        {{"type": "Method", "name": "CVD"}},
+        {{"type": "Carbon_Source", "name": "Acetylene"}}
+    ]
+
+    Now, analyze this text:
+    --- TEXT START ---
+    {chunk_text}
+    --- TEXT END ---
+
+    JSON Output:
+    """
+    response_str = llm_interface.generate_response(prompt)
+    try:
+        # Basic cleanup in case LLM adds markdown backticks
+        response_str = response_str.strip().replace("```json", "").replace("```", "").strip()
+        entities = json.loads(response_str)
+        if isinstance(entities, list):
+            # Validate structure
+            validated_entities = [e for e in entities if isinstance(e, dict) and "type" in e and "name" in e]
+            return validated_entities
+        return []
+    except (json.JSONDecodeError, TypeError):
+        logger.warning(f"Failed to decode LLM response into JSON for entity extraction. Raw response: {response_str[:100]}...")
+        return []
+
+# --- FULLY REVISED parse_and_chunk_documents FUNCTION ---
 def parse_and_chunk_documents(
     documents_path_pattern: str,
-    chunk_strategy: str, # This will be 'recursive'
+    chunk_strategy: str,
+    graph_db: Neo4jGraphDB, # Add graph_db as a required parameter
+    embedding_interface: LLMInterface, # Embedding interface is now also used for entity extraction
     chunk_size: int = config.DEFAULT_CHUNK_SIZE,
     chunk_overlap: int = config.DEFAULT_CHUNK_OVERLAP,
-    embedding_interface: Optional['LLMInterface'] = None, # Not used here, but kept for signature consistency
     logger_parent: logging.Logger = logging.getLogger("CNTRAG")
 ) -> List[Dict[str, Any]]:
     """
-    Parses PDF documents using PyPDF2 and chunks them recursively.
-    This version DOES NOT require the 'unstructured' library and creates detailed source metadata.
+    Parses PDF documents, chunks them, extracts entities, and populates both
+    a vector store and a knowledge graph.
     """
     global logger
     logger = logger_parent
 
-    logger.info(f"Starting document parsing with PyPDF2 (Strategy: 'recursive')")
+    logger.info(f"Starting document parsing and KG population with PyPDF2 (Strategy: '{chunk_strategy}')")
     document_files = glob.glob(documents_path_pattern)
     document_files = [f for f in document_files if os.path.isfile(f) and not os.path.basename(f).startswith('~')]
 
@@ -88,23 +143,21 @@ def parse_and_chunk_documents(
 
     all_final_chunks_list: List[Dict[str, Any]] = []
 
-    # Initialize the recursive splitter once
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
-        separators=[
-            "\n\n", "\n", ". ", "? ", "! ", "; ", ", ", " ", ""
-        ] # Generic separators for recursive splitting
+        separators=["\n\n", "\n", ". ", "? ", "! ", "; ", ", ", " ", ""]
     )
 
     for doc_path in document_files:
         doc_name = os.path.basename(doc_path)
-        
+
         if not doc_path.lower().endswith('.pdf'):
             logger.warning(f"Skipping non-PDF file: {doc_name}")
             continue
-            
+
         logger.info(f"Processing document: {doc_name}")
+        doc_chunks = []
         try:
             with open(doc_path, "rb") as file:
                 pdf_reader = PyPDF2.PdfReader(file)
@@ -118,7 +171,6 @@ def parse_and_chunk_documents(
                         logger.error(f"Error extracting text from {doc_name}, page {page_actual_number}: {page_err}")
                         continue
 
-                    # Split the text from the entire page
                     sub_chunks = splitter.split_text(page_text)
 
                     for sub_idx, chunk_text in enumerate(sub_chunks):
@@ -126,29 +178,44 @@ def parse_and_chunk_documents(
                         if len(cleaned_chunk) < config.MIN_CHUNK_LENGTH:
                             continue
 
-                        # Create a unique, deterministic ID for this specific chunk
-                        hasher = hashlib.sha1()
-                        hasher.update(cleaned_chunk.encode('utf-8'))
-                        content_hash = hasher.hexdigest()[:10]
-                        chunk_id = f"{os.path.splitext(doc_name)[0]}_p{page_actual_number}_c{sub_idx}_{content_hash}"
+                        # Generate a deterministic chunk ID
+                        chunk_id = _create_chunk_id(doc_name, page_actual_number, sub_idx, cleaned_chunk)
 
-                        # Create the detailed metadata dictionary
                         chunk_metadata = {
                             "document_name": doc_name,
                             "page_number": page_actual_number,
-                            "chunk_on_page": sub_idx + 1, # The index of this chunk on this specific page
+                            "chunk_on_page": sub_idx + 1,
                             "chunk_id": chunk_id,
                         }
 
-                        all_final_chunks_list.append({
+                        # This dictionary structure will be used for both the KG and the vector store build
+                        chunk_info = {
                             "chunk_text": cleaned_chunk,
                             "metadata": chunk_metadata
-                        })
+                        }
+                        doc_chunks.append(chunk_info)
+                        all_final_chunks_list.append(chunk_info)
+
+            # --- KG Population Step 1: Add Document and Chunks ---
+            if doc_chunks:
+                graph_db.add_document_and_chunks(doc_name, doc_chunks)
+
+                # --- KG Population Step 2: Extract and Link Entities for each chunk ---
+                logger.info(f"Extracting and linking entities for {len(doc_chunks)} chunks from {doc_name}...")
+                for chunk in doc_chunks:
+                    chunk_id = chunk['metadata']['chunk_id']
+                    chunk_text = chunk['chunk_text']
+                    # Use LLM to get entities
+                    entities = _extract_entities_from_chunk(chunk_text, embedding_interface)
+                    if entities:
+                        # Link the chunk to its found entities in Neo4j
+                        graph_db.link_chunk_to_entities(chunk_id, entities)
 
         except Exception as e:
             logger.exception(f"Failed to process PDF file {doc_path}: {e}")
 
-    logger.info(f"Finished parsing. Total final chunks created: {len(all_final_chunks_list)}")
+    logger.info(f"Finished parsing. Total final chunks created for vector store: {len(all_final_chunks_list)}")
+    # The list returned here is what will be used to build the vector store embeddings
     return all_final_chunks_list
 
 
@@ -159,7 +226,6 @@ def parse_document_text(doc_path: str, logger_param: logging.Logger) -> Optional
     content_list = []
     try:
         if doc_path.lower().endswith(".pdf"):
-            import PyPDF2
             with open(doc_path, "rb") as file:
                 pdf_reader = PyPDF2.PdfReader(file)
                 if pdf_reader.is_encrypted:

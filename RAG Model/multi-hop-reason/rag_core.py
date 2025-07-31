@@ -1,4 +1,5 @@
 # rag_core.py
+import json
 import logging
 import time
 import re
@@ -11,6 +12,8 @@ from llm_interface import LLMInterface
 from vector_store import VectorStore
 from evaluation import evaluate_response, assess_answer_confidence, record_feedback # Assuming this has the correct signature
 from utils import format_reasoning_trace, generate_hop_graph
+from graph_db import Neo4jGraphDB # Import the graph DB class
+
 
 class CNTRagSystem:
     """
@@ -19,6 +22,7 @@ class CNTRagSystem:
     def __init__(self,
                  llm_interface: LLMInterface,
                  vector_store: VectorStore,
+                 graph_db: Neo4jGraphDB, # Add graph_db to init
                  logger: logging.Logger,
                  feedback_db_path: str,
                  feedback_history: List[Dict[str, Any]], # Pass loaded history
@@ -46,6 +50,7 @@ class CNTRagSystem:
         """
         self.llm_interface = llm_interface
         self.vector_store = vector_store
+        self.graph_db = graph_db # Store the graph_db instance
         self.logger = logger
         self.feedback_db_path = feedback_db_path
         self.feedback_history = feedback_history # Use the passed list
@@ -59,7 +64,6 @@ class CNTRagSystem:
             self.logger.critical("Vector store provided is not ready (loaded or built). RAG system may fail.")
 
     # --- Query Processing Steps ---
-
     def _transform_query(self, query: str) -> str:
         """Basic query transformation (lowercase)."""
         self.logger.debug(f"Applying query transformations to: '{query}'")
@@ -427,20 +431,72 @@ class CNTRagSystem:
              final_response = re.sub(r"^\s*Final Synthesized Answer:?.*?\s*", "", final_response, flags=re.IGNORECASE | re.DOTALL).strip()
              return final_response
 
+    # --- NEW: Query Planner Function ---
+    def _plan_query(self, query: str) -> Dict[str, Any]:
+        """
+        Uses an LLM to deconstruct a query into a semantic query and metadata filters.
+        """
+        prompt = f"""
+        You are an expert in Carbon Nanotube research. Analyze the user's query and break it down into a structured search plan.
+        The available entity types for filtering are: "Method", "Catalyst", "Substrate", "CNT_Type", "Carbon_Source".
+
+        User Query: "{query}"
+
+        Based on the query, generate a JSON object with two keys:
+        1. "semantic_query": A rephrased query for vector search, focusing on the core concepts.
+        2. "metadata_filters": A dictionary where keys are entity types and values are entity names. Only include filters explicitly mentioned.
+
+        Example 1:
+        User Query: "How does fixed catalyst iron CVD impact MWCNT growth on silicon?"
+        Your JSON output:
+        {{
+            "semantic_query": "growth dynamics and mechanisms of multi-walled carbon nanotubes using iron fixed catalyst CVD on silicon wafers",
+            "metadata_filters": {{
+                "Method": "CVD",
+                "Catalyst": "Iron",
+                "CNT_Type": "MWCNT",
+                "Substrate": "Silicon"
+            }}
+        }}
+
+        Example 2:
+        User Query: "Tell me about growing carbon nanotubes."
+        Your JSON output:
+        {{
+            "semantic_query": "general principles and techniques for growing carbon nanotubes",
+            "metadata_filters": {{}}
+        }}
+
+        Now, analyze the following query and produce only the JSON output.
+
+        User Query: "{query}"
+        JSON Output:
+        """
+        response_str = self.llm_interface.generate_response(prompt)
+        try:
+            response_str = response_str.strip().replace("```json", "").replace("```", "").strip()
+            plan = json.loads(response_str)
+            if isinstance(plan, dict) and "semantic_query" in plan and "metadata_filters" in plan:
+                return plan
+        except (json.JSONDecodeError, TypeError):
+            self.logger.warning(f"Failed to decode query plan. Using query as is. Raw: {response_str[:100]}...")
+        # Fallback plan
+        return {"semantic_query": query, "metadata_filters": {}}
+    
     def process_query(self, question: str, top_k: int = config.DEFAULT_TOP_K, max_hops: int = config.DEFAULT_MAX_HOPS,
-                      use_query_expansion: bool = False,
-                      request_evaluation: bool = True,
-                      generate_graph: bool = True,
-                      record_user_feedback: Optional[Dict[str, Any]] = None
-                      ) -> Dict[str, Any]:
+                        use_query_expansion: bool = False,
+                        request_evaluation: bool = True,
+                        generate_graph: bool = True,
+                        record_user_feedback: Optional[Dict[str, Any]] = None
+                        ) -> Dict[str, Any]:
         process_start_time = time.time()
         self.logger.info(f"\n--- Starting CNT Query Process for '{self.user_type}' user ---")
         self.logger.info(f"Original Question: '{question}'")
         self.logger.info(f"Config: top_k={top_k}, max_hops={max_hops}, expansion={use_query_expansion}, eval={request_evaluation}, graph={generate_graph}")
 
         if not self.vector_store.is_ready():
-             self.logger.critical("Vector database is not ready. Cannot process query.")
-             return {"final_answer": "Error: Knowledge base not available.", "retrieved_sources": "Initialization Error", "reasoning_trace": [], "formatted_reasoning": "Vector DB not ready", "confidence_score": None, "evaluation_metrics": None, "debug_info": {}}
+            self.logger.critical("Vector database is not ready. Cannot process query.")
+            return {"final_answer": "Error: Knowledge base not available.", "source_info": "Initialization Error", "reasoning_trace": [], "formatted_reasoning": "Vector DB not ready", "confidence_score": None, "evaluation_metrics": None, "debug_info": {}}
 
         original_query = question
         current_query = self._transform_query(original_query)
@@ -449,23 +505,19 @@ class CNTRagSystem:
         reasoning_trace: List[str] = ["START"]
         search_query_history: List[str] = [current_query]
         hops_taken: int = 0
-        
-        # --- FIX: Initialize graph_query_history here ---
         graph_query_history: List[str] = [current_query]
-        # --------------------------------------------------
-
         action: Optional[str] = None
         final_context_sources: List[Dict[str, Any]] = []
         unique_chunk_ids_in_context = set()
 
         if use_query_expansion:
-             self.logger.info("Applying initial query expansion...")
-             expanded_queries = self._expand_query(current_query, num_expansions=2)
-             if expanded_queries:
-                 current_query = expanded_queries[0]
-                 search_query_history = list(dict.fromkeys(expanded_queries))
-                 graph_query_history = list(dict.fromkeys(expanded_queries)) # Overwrite with expanded queries
-                 reasoning_trace.append(f"Initial Expanded Queries: {expanded_queries}")
+            self.logger.info("Applying initial query expansion...")
+            expanded_queries = self._expand_query(current_query, num_expansions=2)
+            if expanded_queries:
+                current_query = expanded_queries[0]
+                search_query_history = list(dict.fromkeys(expanded_queries))
+                graph_query_history = list(dict.fromkeys(expanded_queries))
+                reasoning_trace.append(f"Initial Expanded Queries: {expanded_queries}")
 
         for hop in range(max_hops):
             hops_taken = hop + 1
@@ -473,34 +525,66 @@ class CNTRagSystem:
             reasoning_trace.append(f"--- Hop {hops_taken} ---")
 
             if not current_query:
-                 self.logger.warning(f"Hop {hops_taken}: Query is empty. Breaking.")
-                 reasoning_trace.append(f"Hop {hops_taken}: Error - Query empty.")
-                 break
+                self.logger.warning(f"Hop {hops_taken}: Query is empty. Breaking.")
+                reasoning_trace.append(f"Hop {hops_taken}: Error - Query empty.")
+                break
 
+            # --- START OF CORRECTED HYBRID SEARCH LOGIC ---
             retrieval_succeeded_this_hop = False
-            self.logger.info(f"Retrieving context for query: '{current_query}'")
-            reasoning_trace.append(f"Hop {hops_taken}: Retrieving with query -> '{current_query}'")
-            query_embedding = self.llm_interface.get_embedding(current_query, task_type="RETRIEVAL_QUERY")
+            retrieved_chunks: List[Dict[str, Any]] = []
+            
+            # 1. Plan the query to get semantic part and metadata filters
+            search_plan = self._plan_query(current_query)
+            semantic_query = search_plan.get("semantic_query", current_query)
+            metadata_filters = search_plan.get("metadata_filters", {})
+            reasoning_trace.append(f"Hop {hops_taken}: Planned Query -> Semantic='{semantic_query[:100]}...', Filters={metadata_filters}")
 
-            retrieved_chunks: List[Dict[str,Any]] = []
+            # 2. Get candidate chunk IDs from the KG if filters exist
+            candidate_chunk_ids = []
+            if metadata_filters:
+                candidate_chunk_ids = self.graph_db.get_chunk_ids_for_entities(metadata_filters)
+                if not candidate_chunk_ids:
+                    self.logger.warning(f"KG found no chunks matching filters {metadata_filters}. Proceeding with semantic search on all data.")
+                    reasoning_trace.append(f"Hop {hops_taken}: KG found no matching chunks for filters.")
+                else:
+                    reasoning_trace.append(f"Hop {hops_taken}: KG pre-filtered to {len(candidate_chunk_ids)} candidate chunks.")
+
+            # 3. Perform vector search using the SEMANTIC query
+            self.logger.info(f"Retrieving context for semantic query: '{semantic_query}'")
+            query_embedding = self.llm_interface.get_embedding(semantic_query, task_type="RETRIEVAL_QUERY")
+
             if query_embedding is None:
                 self.logger.error("Query embedding failed. Cannot retrieve.")
                 reasoning_trace.append(f"Hop {hops_taken}: Query embedding failed.")
             else:
-                retrieved_chunks = self.vector_store.query(query_embedding, top_k=top_k)
-                if not retrieved_chunks:
-                     self.logger.warning(f"Retrieval returned no relevant chunks for hop {hops_taken}.")
-                     reasoning_trace.append(f"Hop {hops_taken}: Retrieval yielded no results.")
+                # Retrieve a larger pool of candidates from the vector store
+                all_retrieved_chunks = self.vector_store.query(query_embedding, top_k=top_k * 5)
+
+                if candidate_chunk_ids:
+                    # Filter the vector results by the KG candidates
+                    final_filtered_chunks = [
+                        chunk for chunk in all_retrieved_chunks if chunk.get("id") in candidate_chunk_ids
+                    ]
+                    retrieved_chunks = final_filtered_chunks[:top_k]
+                    self.logger.info(f"Post-filtered {len(all_retrieved_chunks)} vector results down to {len(retrieved_chunks)} based on KG.")
                 else:
-                     self.logger.info(f"Retrieved {len(retrieved_chunks)} chunks for hop {hops_taken}.")
-                     top_score_str = f"{retrieved_chunks[0]['score']:.4f}" if retrieved_chunks else "N/A"
-                     reasoning_trace.append(f"Hop {hops_taken}: Retrieved {len(retrieved_chunks)} chunk(s). Top score: {top_score_str}")
-                     retrieval_succeeded_this_hop = True
-            
+                    # No KG filters, so just use the top vector results
+                    retrieved_chunks = all_retrieved_chunks[:top_k]
+
+                if not retrieved_chunks:
+                    self.logger.warning(f"Hybrid retrieval returned no relevant chunks for hop {hops_taken}.")
+                    reasoning_trace.append(f"Hop {hops_taken}: Hybrid retrieval yielded no results.")
+                else:
+                    self.logger.info(f"Hybrid retrieval found {len(retrieved_chunks)} chunks for hop {hops_taken}.")
+                    top_score_str = f"{retrieved_chunks[0]['score']:.4f}" if retrieved_chunks else "N/A"
+                    reasoning_trace.append(f"Hop {hops_taken}: Retrieved {len(retrieved_chunks)} chunk(s). Top score: {top_score_str}")
+                    retrieval_succeeded_this_hop = True
+            # --- END OF CORRECTED HYBRID SEARCH LOGIC ---
+
             accumulated_context_list, added_unique_chunks_dicts = self._manage_context(
-                 accumulated_context_list,
-                 retrieved_chunks,
-                 original_query
+                accumulated_context_list,
+                retrieved_chunks,
+                original_query
             )
 
             if added_unique_chunks_dicts:
@@ -508,6 +592,7 @@ class CNTRagSystem:
                 for chunk_data in added_unique_chunks_dicts:
                     chunk_id = chunk_data.get('id')
                     if chunk_id and chunk_id not in unique_chunk_ids_in_context:
+                        # NOTE: final_context_sources is the correct variable to populate now
                         final_context_sources.append({
                             "document_name": chunk_data.get("metadata", {}).get("document_name", "N/A"),
                             "page_number": chunk_data.get("metadata", {}).get("page_number", "N/A"),
@@ -517,37 +602,35 @@ class CNTRagSystem:
                         })
                         unique_chunk_ids_in_context.add(chunk_id)
             elif retrieved_chunks:
-                 reasoning_trace.append(f"Hop {hops_taken}: No new unique chunks added (duplicates/similar).")
+                reasoning_trace.append(f"Hop {hops_taken}: No new unique chunks added (duplicates/similar).")
 
             full_context_for_reasoning = "\n\n==== CONTEXT FROM HOP/SUMMARY SEPARATOR ====\n\n".join(accumulated_context_list)
             
             action, value = self._reason_and_refine_query(
                 original_query,
                 full_context_for_reasoning,
-                graph_query_history, # Use graph_query_history for reasoning context
+                graph_query_history,
                 hops_taken,
                 retrieval_failed_last=(not retrieval_succeeded_this_hop)
             )
             reasoning_trace.append(f"Hop {hops_taken}: Reasoning result -> Action='{action}', Value='{value[:100]}...'")
 
             if action == "ANSWER_COMPLETE":
-                 self.logger.info("Reasoning concluded: ANSWER_COMPLETE.")
-                 reasoning_trace.append(f"Hop {hops_taken}: Reasoning -> ANSWER_COMPLETE. Proceeding to final answer.")
-                 break
+                self.logger.info("Reasoning concluded: ANSWER_COMPLETE.")
+                reasoning_trace.append(f"Hop {hops_taken}: Reasoning -> ANSWER_COMPLETE. Proceeding to final answer.")
+                break
             elif action == "NEXT_QUERY":
-                 next_raw_query = value
-                 current_query = self._transform_query(next_raw_query)
-                 reasoning_trace.append(f"Hop {hops_taken}: Reasoning -> NEXT_QUERY = '{current_query}'")
-                 # --- FIX: Update both histories ---
-                 if not search_query_history or current_query != search_query_history[-1]:
-                     search_query_history.append(current_query)
-                 if not graph_query_history or current_query != graph_query_history[-1]:
-                      graph_query_history.append(current_query)
-                 # ---------------------------------
+                next_raw_query = value
+                current_query = self._transform_query(next_raw_query)
+                reasoning_trace.append(f"Hop {hops_taken}: Reasoning -> NEXT_QUERY = '{current_query}'")
+                if not search_query_history or current_query != search_query_history[-1]:
+                    search_query_history.append(current_query)
+                if not graph_query_history or current_query != graph_query_history[-1]:
+                    graph_query_history.append(current_query)
             else:
-                 self.logger.error(f"Reasoning resulted in '{action}': {value}. Stopping multihop.")
-                 reasoning_trace.append(f"Hop {hops_taken}: Reasoning -> {action}: {value}. Proceeding to final answer.")
-                 break
+                self.logger.error(f"Reasoning resulted in '{action}': {value}. Stopping multihop.")
+                reasoning_trace.append(f"Hop {hops_taken}: Reasoning -> {action}: {value}. Proceeding to final answer.")
+                break
 
         if hops_taken >= max_hops and action != "ANSWER_COMPLETE":
             self.logger.info("Max hops reached. Proceeding to final answer generation.")
@@ -614,11 +697,12 @@ class CNTRagSystem:
         )
 
         return {
-            "final_answer": final_answer,
-            "source_info": f"Synthesized from context ({type(self.vector_store).__name__}) over {hops_taken} hop(s).",
-            "reasoning_trace": reasoning_trace,
-            "formatted_reasoning": formatted_reasoning,
-            "confidence_score": confidence_score,
-            "evaluation_metrics": evaluation_metrics,
-            "debug_info": debug_info
-        }
+        "final_answer": final_answer,
+        "retrieved_sources": final_context_sources, # Add this for correct printing in main.py
+        "source_info": f"Synthesized from context (KG+VDB) over {hops_taken} hop(s).",
+        "reasoning_trace": reasoning_trace,
+        "formatted_reasoning": formatted_reasoning,
+        "confidence_score": confidence_score,
+        "evaluation_metrics": evaluation_metrics,
+        "debug_info": debug_info
+    }
