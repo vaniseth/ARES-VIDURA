@@ -9,11 +9,10 @@ from typing import List, Optional, Dict, Any, Tuple
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 import PyPDF2
 import config
-
-
 # Import the new graph DB class
 from graph_db import Neo4jGraphDB
 from llm_interface import LLMInterface
+from unstructured.partition.auto import partition
 
 logger = logging.getLogger("CNTRAG_DataProcessing")
 
@@ -116,24 +115,29 @@ def _extract_entities_from_chunk(chunk_text: str, llm_interface: LLMInterface) -
         logger.warning(f"Failed to decode LLM response into JSON for entity extraction. Raw response: {response_str[:100]}...")
         return []
 
-# --- FULLY REVISED parse_and_chunk_documents FUNCTION ---
+# This is a new helper function for our smart chunking
+def _create_chunk_id(doc_name: str, element_idx: int, chunk_idx: int) -> str:
+    """Creates a unique ID for a chunk based on its document and position."""
+    # We remove the content hash for simplicity as position is now more stable
+    return f"{os.path.splitext(doc_name)[0]}_elem{element_idx}_chunk{chunk_idx}"
+
+# --- THE NEW, FULLY REVISED parse_and_chunk_documents ---
 def parse_and_chunk_documents(
     documents_path_pattern: str,
-    chunk_strategy: str,
-    graph_db: Neo4jGraphDB, # Add graph_db as a required parameter
-    embedding_interface: LLMInterface, # Embedding interface is now also used for entity extraction
+    graph_db: Neo4jGraphDB,
+    embedding_interface: LLMInterface,
     chunk_size: int = config.DEFAULT_CHUNK_SIZE,
     chunk_overlap: int = config.DEFAULT_CHUNK_OVERLAP,
     logger_parent: logging.Logger = logging.getLogger("CNTRAG")
 ) -> List[Dict[str, Any]]:
     """
-    Parses PDF documents, chunks them, extracts entities, and populates both
-    a vector store and a knowledge graph.
+    Parses documents using `unstructured` to preserve hierarchy, creates smart chunks,
+    extracts entities, and populates both a vector store and a knowledge graph.
     """
     global logger
     logger = logger_parent
 
-    logger.info(f"Starting document parsing and KG population with PyPDF2 (Strategy: '{chunk_strategy}')")
+    logger.info(f"Starting 'Smart Chunking' document parsing with `unstructured`...")
     document_files = glob.glob(documents_path_pattern)
     document_files = [f for f in document_files if os.path.isfile(f) and not os.path.basename(f).startswith('~')]
 
@@ -141,82 +145,77 @@ def parse_and_chunk_documents(
         logger.error(f"No document files found matching pattern: {documents_path_pattern}")
         return []
 
-    all_final_chunks_list: List[Dict[str, Any]] = []
-
-    splitter = RecursiveCharacterTextSplitter(
+    all_final_chunks_for_vector_store: List[Dict[str, Any]] = []
+    text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap,
-        separators=["\n\n", "\n", ". ", "? ", "! ", "; ", ", ", " ", ""]
+        chunk_overlap=chunk_overlap
     )
 
     for doc_path in document_files:
         doc_name = os.path.basename(doc_path)
+        logger.info(f"Processing document: {doc_name} with `unstructured`")
 
-        if not doc_path.lower().endswith('.pdf'):
-            logger.warning(f"Skipping non-PDF file: {doc_name}")
-            continue
-
-        logger.info(f"Processing document: {doc_name}")
-        doc_chunks = []
         try:
-            with open(doc_path, "rb") as file:
-                pdf_reader = PyPDF2.PdfReader(file)
-                for page_num, page in enumerate(pdf_reader.pages):
-                    page_actual_number = page_num + 1
-                    try:
-                        page_text = page.extract_text()
-                        if not page_text or len(page_text.strip()) < config.MIN_CHUNK_LENGTH:
-                            continue
-                    except Exception as page_err:
-                        logger.error(f"Error extracting text from {doc_name}, page {page_actual_number}: {page_err}")
+            # `unstructured` partitions the document into semantic elements
+            elements = partition(filename=doc_path, strategy="hi_res")
+            
+            doc_chunks_for_kg = []
+            
+            # --- Smart Chunking Logic ---
+            for i, element in enumerate(elements):
+                element_type = type(element).__name__
+                # Titles and headers are important context
+                if element_type == "Title" or "Header" in element_type:
+                    # We merge titles with the text that follows them for better context
+                    if i + 1 < len(elements):
+                        # Prepend title to the text of the next element
+                        next_element_text = str(elements[i+1])
+                        elements[i+1].text = f"{str(element)}\n\n{next_element_text}"
+                        logger.debug(f"Merged title '{str(element)}' with next element.")
+                    continue # Skip processing the title as a separate chunk
+
+                # Split larger text elements, but keep smaller ones whole
+                if len(str(element).strip()) > chunk_overlap:
+                    sub_chunks = text_splitter.split_text(str(element))
+                else:
+                    sub_chunks = [str(element)]
+                
+                for j, chunk_text in enumerate(sub_chunks):
+                    cleaned_chunk = chunk_text.strip()
+                    if len(cleaned_chunk) < config.MIN_CHUNK_LENGTH:
                         continue
 
-                    sub_chunks = splitter.split_text(page_text)
+                    chunk_id = _create_chunk_id(doc_name, i, j)
+                    
+                    # Create rich metadata for each chunk
+                    chunk_metadata = {
+                        "document_name": doc_name,
+                        "chunk_id": chunk_id,
+                        "element_type": element_type, # e.g., 'NarrativeText', 'ListItem'
+                        "page_number": getattr(element.metadata, 'page_number', None)
+                    }
 
-                    for sub_idx, chunk_text in enumerate(sub_chunks):
-                        cleaned_chunk = chunk_text.strip()
-                        if len(cleaned_chunk) < config.MIN_CHUNK_LENGTH:
-                            continue
-
-                        # Generate a deterministic chunk ID
-                        chunk_id = _create_chunk_id(doc_name, page_actual_number, sub_idx, cleaned_chunk)
-
-                        chunk_metadata = {
-                            "document_name": doc_name,
-                            "page_number": page_actual_number,
-                            "chunk_on_page": sub_idx + 1,
-                            "chunk_id": chunk_id,
-                        }
-
-                        # This dictionary structure will be used for both the KG and the vector store build
-                        chunk_info = {
-                            "chunk_text": cleaned_chunk,
-                            "metadata": chunk_metadata
-                        }
-                        doc_chunks.append(chunk_info)
-                        all_final_chunks_list.append(chunk_info)
-
-            # --- KG Population Step 1: Add Document and Chunks ---
-            if doc_chunks:
-                graph_db.add_document_and_chunks(doc_name, doc_chunks)
-
-                # --- KG Population Step 2: Extract and Link Entities for each chunk ---
-                logger.info(f"Extracting and linking entities for {len(doc_chunks)} chunks from {doc_name}...")
-                for chunk in doc_chunks:
-                    chunk_id = chunk['metadata']['chunk_id']
-                    chunk_text = chunk['chunk_text']
-                    # Use LLM to get entities
-                    entities = _extract_entities_from_chunk(chunk_text, embedding_interface)
+                    chunk_info = {
+                        "chunk_text": cleaned_chunk,
+                        "metadata": chunk_metadata
+                    }
+                    doc_chunks_for_kg.append(chunk_info)
+                    all_final_chunks_for_vector_store.append(chunk_info)
+            
+            # --- KG Population (Same as before, but with better chunks) ---
+            if doc_chunks_for_kg:
+                graph_db.add_document_and_chunks(doc_name, doc_chunks_for_kg)
+                logger.info(f"Extracting and linking entities for {len(doc_chunks_for_kg)} smart chunks from {doc_name}...")
+                for chunk in doc_chunks_for_kg:
+                    entities = _extract_entities_from_chunk(chunk['chunk_text'], embedding_interface)
                     if entities:
-                        # Link the chunk to its found entities in Neo4j
-                        graph_db.link_chunk_to_entities(chunk_id, entities)
+                        graph_db.link_chunk_to_entities(chunk['metadata']['chunk_id'], entities)
 
         except Exception as e:
-            logger.exception(f"Failed to process PDF file {doc_path}: {e}")
-
-    logger.info(f"Finished parsing. Total final chunks created for vector store: {len(all_final_chunks_list)}")
-    # The list returned here is what will be used to build the vector store embeddings
-    return all_final_chunks_list
+            logger.exception(f"Failed to process file {doc_path} with `unstructured`: {e}")
+            
+    logger.info(f"Finished parsing. Total smart chunks created for vector store: {len(all_final_chunks_for_vector_store)}")
+    return all_final_chunks_for_vector_store
 
 
 # Fallback basic parser (ensure it's defined or imported correctly)

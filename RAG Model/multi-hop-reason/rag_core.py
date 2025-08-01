@@ -483,6 +483,59 @@ class CNTRagSystem:
         # Fallback plan
         return {"semantic_query": query, "metadata_filters": {}}
     
+    # --- NEW: Query Router Function ---
+    def _route_query(self, query: str) -> Dict[str, Any]:
+        """
+        Analyzes the user's query and determines the best retrieval strategy.
+        """
+        # Note: In a more advanced system, this could also choose 'web_search' etc.
+        prompt = f"""
+        You are an intelligent query routing agent for a scientific RAG system.
+        Your task is to analyze the user's query and decide the best strategy to find the answer.
+        You have two primary retrieval strategies available:
+        1. "vector_search": Best for broad, conceptual, or open-ended questions where semantic meaning is key.
+        2. "hybrid_search": Best for specific questions that contain clear filters like material names, methods, or conditions. This strategy uses a Knowledge Graph for filtering.
+
+        Analyze the user's query below. Based on its content, decide which strategy is more appropriate.
+        Then, generate a JSON object with two keys:
+        1. "strategy": Either "vector_search" or "hybrid_search".
+        2. "content": A rephrased, clean query for the chosen strategy. For "hybrid_search", this will be used for the semantic part of the search.
+
+        Examples:
+        - User Query: "What are the main challenges in controlling MWCNT diameter?"
+          - Analysis: This is a broad, conceptual question. Vector search is best.
+          - Output: {{"strategy": "vector_search", "content": "main challenges and methods for controlling multi-walled carbon nanotube diameter"}}
+
+        - User Query: "Find papers on VACNT pillar growth with fixed iron catalysts."
+          - Analysis: This is very specific with clear entities (VACNT, fixed catalyst, iron). Hybrid search is best.
+          - Output: {{"strategy": "hybrid_search", "content": "vertically aligned carbon nanotube pillar growth dynamics with fixed iron catalysts"}}
+        
+        - User Query: "Tell me about carbon nanotubes."
+          - Analysis: Very broad. Vector search is the most appropriate starting point.
+          - Output: {{"strategy": "vector_search", "content": "overview of carbon nanotube properties, synthesis, and applications"}}
+
+        Now, analyze the following query and produce only the JSON output.
+
+        User Query: "{query}"
+        JSON Output:
+        """
+        response_str = self.llm_interface.generate_response(prompt)
+        try:
+            # Cleanup and parse the JSON response
+            response_str = response_str.strip().replace("```json", "").replace("```", "").strip()
+            route = json.loads(response_str)
+            if isinstance(route, dict) and "strategy" in route and "content" in route:
+                if route["strategy"] in ["vector_search", "hybrid_search"]:
+                    self.logger.info(f"Query Router decided on strategy: '{route['strategy']}'")
+                    return route
+        except (json.JSONDecodeError, TypeError):
+            self.logger.warning(f"Failed to decode router response. Defaulting to vector_search. Raw: {response_str[:100]}...")
+        
+        # Fallback to a default strategy if parsing fails
+        return {"strategy": "vector_search", "content": query}
+    
+    
+    
     def process_query(self, question: str, top_k: int = config.DEFAULT_TOP_K, max_hops: int = config.DEFAULT_MAX_HOPS,
                         use_query_expansion: bool = False,
                         request_evaluation: bool = True,
@@ -496,7 +549,7 @@ class CNTRagSystem:
 
         if not self.vector_store.is_ready():
             self.logger.critical("Vector database is not ready. Cannot process query.")
-            return {"final_answer": "Error: Knowledge base not available.", "source_info": "Initialization Error", "reasoning_trace": [], "formatted_reasoning": "Vector DB not ready", "confidence_score": None, "evaluation_metrics": None, "debug_info": {}}
+            return {"final_answer": "Error: Knowledge base not available.", "retrieved_sources": [], "reasoning_trace": [], "formatted_reasoning": "Vector DB not ready", "confidence_score": None, "evaluation_metrics": None, "debug_info": {}}
 
         original_query = question
         current_query = self._transform_query(original_query)
@@ -529,58 +582,59 @@ class CNTRagSystem:
                 reasoning_trace.append(f"Hop {hops_taken}: Error - Query empty.")
                 break
 
-            # --- START OF CORRECTED HYBRID SEARCH LOGIC ---
-            retrieval_succeeded_this_hop = False
+            # --- AGENTIC ROUTER & RETRIEVAL LOGIC ---
+            
+            # 1. Route the current query to decide on a retrieval strategy
+            route = self._route_query(current_query)
+            strategy = route.get("strategy", "vector_search")
+            semantic_query = route.get("content", current_query)
+            reasoning_trace.append(f"Hop {hops_taken}: Routing -> Strategy='{strategy}', Query='{semantic_query[:100]}...'")
+
             retrieved_chunks: List[Dict[str, Any]] = []
             
-            # 1. Plan the query to get semantic part and metadata filters
-            search_plan = self._plan_query(current_query)
-            semantic_query = search_plan.get("semantic_query", current_query)
-            metadata_filters = search_plan.get("metadata_filters", {})
-            reasoning_trace.append(f"Hop {hops_taken}: Planned Query -> Semantic='{semantic_query[:100]}...', Filters={metadata_filters}")
+            # 2. Execute the chosen strategy
+            if strategy == "hybrid_search":
+                # For hybrid search, we also need to plan the metadata filters
+                search_plan = self._plan_query(semantic_query) # _plan_query from previous step
+                metadata_filters = search_plan.get("metadata_filters", {})
+                reasoning_trace.append(f"Hop {hops_taken}: Hybrid Plan -> Filters={metadata_filters}")
+                
+                candidate_chunk_ids = []
+                if metadata_filters:
+                    candidate_chunk_ids = self.graph_db.get_chunk_ids_for_entities(metadata_filters)
+                    if not candidate_chunk_ids:
+                        reasoning_trace.append(f"Hop {hops_taken}: KG found no matching chunks for filters.")
+                    else:
+                        reasoning_trace.append(f"Hop {hops_taken}: KG pre-filtered to {len(candidate_chunk_ids)} candidate chunks.")
 
-            # 2. Get candidate chunk IDs from the KG if filters exist
-            candidate_chunk_ids = []
-            if metadata_filters:
-                candidate_chunk_ids = self.graph_db.get_chunk_ids_for_entities(metadata_filters)
-                if not candidate_chunk_ids:
-                    self.logger.warning(f"KG found no chunks matching filters {metadata_filters}. Proceeding with semantic search on all data.")
-                    reasoning_trace.append(f"Hop {hops_taken}: KG found no matching chunks for filters.")
-                else:
-                    reasoning_trace.append(f"Hop {hops_taken}: KG pre-filtered to {len(candidate_chunk_ids)} candidate chunks.")
+                # Perform the vector search part of the hybrid search
+                query_embedding = self.llm_interface.get_embedding(semantic_query, task_type="RETRIEVAL_QUERY")
+                if query_embedding:
+                    all_retrieved = self.vector_store.query(query_embedding, top_k=top_k * 5) # Retrieve more for better filtering
+                    if candidate_chunk_ids:
+                        retrieved_chunks = [c for c in all_retrieved if c.get("id") in candidate_chunk_ids][:top_k]
+                    else:
+                        retrieved_chunks = all_retrieved[:top_k]
+            
+            else: # strategy == "vector_search"
+                reasoning_trace.append(f"Hop {hops_taken}: Executing pure vector search.")
+                query_embedding = self.llm_interface.get_embedding(semantic_query, task_type="RETRIEVAL_QUERY")
+                if query_embedding:
+                    retrieved_chunks = self.vector_store.query(query_embedding, top_k=top_k)
 
-            # 3. Perform vector search using the SEMANTIC query
-            self.logger.info(f"Retrieving context for semantic query: '{semantic_query}'")
-            query_embedding = self.llm_interface.get_embedding(semantic_query, task_type="RETRIEVAL_QUERY")
-
-            if query_embedding is None:
-                self.logger.error("Query embedding failed. Cannot retrieve.")
-                reasoning_trace.append(f"Hop {hops_taken}: Query embedding failed.")
+            # 3. Process the results of whichever strategy was used
+            retrieval_succeeded_this_hop = False
+            if not retrieved_chunks:
+                self.logger.warning(f"Retrieval (strategy: {strategy}) returned no chunks for hop {hops_taken}.")
+                reasoning_trace.append(f"Hop {hops_taken}: Retrieval yielded no results.")
             else:
-                # Retrieve a larger pool of candidates from the vector store
-                all_retrieved_chunks = self.vector_store.query(query_embedding, top_k=top_k * 5)
+                self.logger.info(f"Retrieval (strategy: {strategy}) found {len(retrieved_chunks)} chunks.")
+                top_score_str = f"{retrieved_chunks[0]['score']:.4f}" if retrieved_chunks else "N/A"
+                reasoning_trace.append(f"Hop {hops_taken}: Retrieved {len(retrieved_chunks)} chunk(s). Top score: {top_score_str}")
+                retrieval_succeeded_this_hop = True
 
-                if candidate_chunk_ids:
-                    # Filter the vector results by the KG candidates
-                    final_filtered_chunks = [
-                        chunk for chunk in all_retrieved_chunks if chunk.get("id") in candidate_chunk_ids
-                    ]
-                    retrieved_chunks = final_filtered_chunks[:top_k]
-                    self.logger.info(f"Post-filtered {len(all_retrieved_chunks)} vector results down to {len(retrieved_chunks)} based on KG.")
-                else:
-                    # No KG filters, so just use the top vector results
-                    retrieved_chunks = all_retrieved_chunks[:top_k]
-
-                if not retrieved_chunks:
-                    self.logger.warning(f"Hybrid retrieval returned no relevant chunks for hop {hops_taken}.")
-                    reasoning_trace.append(f"Hop {hops_taken}: Hybrid retrieval yielded no results.")
-                else:
-                    self.logger.info(f"Hybrid retrieval found {len(retrieved_chunks)} chunks for hop {hops_taken}.")
-                    top_score_str = f"{retrieved_chunks[0]['score']:.4f}" if retrieved_chunks else "N/A"
-                    reasoning_trace.append(f"Hop {hops_taken}: Retrieved {len(retrieved_chunks)} chunk(s). Top score: {top_score_str}")
-                    retrieval_succeeded_this_hop = True
-            # --- END OF CORRECTED HYBRID SEARCH LOGIC ---
-
+            # --- REMAINDER OF THE LOOP IS THE SAME ---
+            
             accumulated_context_list, added_unique_chunks_dicts = self._manage_context(
                 accumulated_context_list,
                 retrieved_chunks,
@@ -592,7 +646,6 @@ class CNTRagSystem:
                 for chunk_data in added_unique_chunks_dicts:
                     chunk_id = chunk_data.get('id')
                     if chunk_id and chunk_id not in unique_chunk_ids_in_context:
-                        # NOTE: final_context_sources is the correct variable to populate now
                         final_context_sources.append({
                             "document_name": chunk_data.get("metadata", {}).get("document_name", "N/A"),
                             "page_number": chunk_data.get("metadata", {}).get("page_number", "N/A"),
@@ -647,15 +700,14 @@ class CNTRagSystem:
             confidence_score = assess_answer_confidence(final_answer, final_context_str, original_query, self.llm_interface, self.logger)
             reasoning_trace.append(f"Confidence Score: {confidence_score:.2f}" if confidence_score is not None else "Confidence Score: N/A")
             if request_evaluation:
-                 evaluation_metrics = evaluate_response(original_query, final_answer, final_context_str, self.llm_interface, self.logger)
-                 eval_summary = {k: v for k, v in evaluation_metrics.items() if 'rating' in k}
-                 reasoning_trace.append(f"Evaluation Metrics: {eval_summary}")
+                evaluation_metrics = evaluate_response(original_query, final_answer, final_context_str, self.llm_interface, self.logger)
+                eval_summary = {k: v for k, v in evaluation_metrics.items() if 'rating' in k}
+                reasoning_trace.append(f"Evaluation Metrics: {eval_summary}")
 
         formatted_reasoning = format_reasoning_trace(reasoning_trace)
         
         graph_filename = None
         if generate_graph:
-            # This call will now succeed because graph_query_history is guaranteed to exist
             graph_filename = generate_hop_graph(reasoning_trace, graph_query_history, self.graph_dir, self.logger)
 
         process_end_time = time.time()
@@ -678,7 +730,7 @@ class CNTRagSystem:
 
         user_rating = record_user_feedback.get('rating') if record_user_feedback else None
         user_comment = record_user_feedback.get('comment') if record_user_feedback else None
-        # Make sure record_feedback has the correct signature in evaluation.py
+        
         record_feedback(
             feedback_history=self.feedback_history,
             feedback_db_path=self.feedback_db_path,
@@ -697,12 +749,12 @@ class CNTRagSystem:
         )
 
         return {
-        "final_answer": final_answer,
-        "retrieved_sources": final_context_sources, # Add this for correct printing in main.py
-        "source_info": f"Synthesized from context (KG+VDB) over {hops_taken} hop(s).",
-        "reasoning_trace": reasoning_trace,
-        "formatted_reasoning": formatted_reasoning,
-        "confidence_score": confidence_score,
-        "evaluation_metrics": evaluation_metrics,
-        "debug_info": debug_info
-    }
+            "final_answer": final_answer,
+            "retrieved_sources": final_context_sources,
+            "source_info": f"Synthesized from context (KG+VDB, Strategy: {strategy}) over {hops_taken} hop(s).",
+            "reasoning_trace": reasoning_trace,
+            "formatted_reasoning": formatted_reasoning,
+            "confidence_score": confidence_score,
+            "evaluation_metrics": evaluation_metrics,
+            "debug_info": debug_info
+        }

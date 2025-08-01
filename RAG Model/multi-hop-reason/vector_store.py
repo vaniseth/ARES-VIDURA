@@ -46,18 +46,17 @@ class VectorStore(ABC):
                               documents_path_pattern: str,
                               chunk_settings: Dict,
                               embedding_interface: LLMInterface,
-                              graph_db: Neo4jGraphDB) -> Optional[List[Dict[str, Any]]]: # Add graph_db parameter
+                              graph_db: Neo4jGraphDB) -> Optional[List[Dict[str, Any]]]:
         """Internal helper to parse, chunk, embed documents, and populate KG."""
-        self.logger.info("Starting internal index build process (including KG population)...")
+        self.logger.info("Starting internal index build process with smart chunking...")
 
         # This now calls the simplified PyPDF2-based parser
         all_chunks_info = parse_and_chunk_documents(
             documents_path_pattern=documents_path_pattern,
-            chunk_strategy=chunk_settings.get('strategy', 'recursive'),
+            graph_db=graph_db,
+            embedding_interface=embedding_interface,
             chunk_size=chunk_settings.get('size', config.DEFAULT_CHUNK_SIZE),
             chunk_overlap=chunk_settings.get('overlap', config.DEFAULT_CHUNK_OVERLAP),
-            embedding_interface=embedding_interface,
-            graph_db=graph_db, # Pass the graph_db object
             logger_parent=self.logger
         )
 
@@ -147,10 +146,9 @@ class PandasVectorStore(VectorStore):
             self.vector_db_df = pd.read_csv(self.db_path)
             
             # Convert strings back to numpy arrays and dicts
-            self.vector_db_df['embeddings'] = self.vector_db_df['embeddings_str'].apply(lambda x: np.array(json.loads(x)))
-            self.vector_db_df['metadata'] = self.vector_db_df['metadata_str'].apply(lambda x: json.loads(x))
-            
-            self.vector_db_df.drop(columns=['embeddings_str', 'metadata_str'], inplace=True)
+            self.vector_db_df['embeddings'] = self.vector_db_df['embeddings_list_str'].apply(lambda x: np.array(json.loads(x)))
+            self.vector_db_df['metadata'] = self.vector_db_df['metadata_json_str'].apply(lambda x: json.loads(x))
+            self.vector_db_df.drop(columns=['embeddings_list_str', 'metadata_json_str'], inplace=True)
             
             self.logger.info(f"Vector database loaded successfully. Shape: {self.vector_db_df.shape}")
             self._is_ready = True
