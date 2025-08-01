@@ -131,13 +131,13 @@ def parse_and_chunk_documents(
     logger_parent: logging.Logger = logging.getLogger("CNTRAG")
 ) -> List[Dict[str, Any]]:
     """
-    Parses documents using `unstructured` to preserve hierarchy, creates smart chunks,
-    extracts entities, and populates both a vector store and a knowledge graph.
+    Parses documents using `unstructured` for multi-modal RAG. It handles text,
+    tables, and images, creating descriptive text chunks for each.
     """
     global logger
     logger = logger_parent
 
-    logger.info(f"Starting 'Smart Chunking' document parsing with `unstructured`...")
+    logger.info("Starting MULTI-MODAL document parsing with `unstructured`...")
     document_files = glob.glob(documents_path_pattern)
     document_files = [f for f in document_files if os.path.isfile(f) and not os.path.basename(f).startswith('~')]
 
@@ -146,75 +146,97 @@ def parse_and_chunk_documents(
         return []
 
     all_final_chunks_for_vector_store: List[Dict[str, Any]] = []
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap
-    )
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
 
     for doc_path in document_files:
         doc_name = os.path.basename(doc_path)
-        logger.info(f"Processing document: {doc_name} with `unstructured`")
+        logger.info(f"Processing document: {doc_name}")
 
         try:
-            # `unstructured` partitions the document into semantic elements
-            elements = partition(filename=doc_path, strategy="hi_res")
+            # Use "hi_res" strategy to extract images and tables accurately
+            # This may require setting UNSTRUCTURED_API_KEY for the best results
+            # elements = partition(filename=doc_path, strategy="hi_res", infer_table_structure=True)
+            # The new line using a more direct strategy
+            elements = partition(filename=doc_path, strategy="fast")
             
-            doc_chunks_for_kg = []
+            doc_all_chunks_for_kg = []
             
-            # --- Smart Chunking Logic ---
             for i, element in enumerate(elements):
                 element_type = type(element).__name__
-                # Titles and headers are important context
-                if element_type == "Title" or "Header" in element_type:
-                    # We merge titles with the text that follows them for better context
-                    if i + 1 < len(elements):
-                        # Prepend title to the text of the next element
-                        next_element_text = str(elements[i+1])
-                        elements[i+1].text = f"{str(element)}\n\n{next_element_text}"
-                        logger.debug(f"Merged title '{str(element)}' with next element.")
-                    continue # Skip processing the title as a separate chunk
+                element_chunks = []
 
-                # Split larger text elements, but keep smaller ones whole
-                if len(str(element).strip()) > chunk_overlap:
-                    sub_chunks = text_splitter.split_text(str(element))
-                else:
-                    sub_chunks = [str(element)]
+                if element_type == "Table":
+                    table_html = getattr(element.metadata, 'text_as_html', str(element))
+                    # Convert HTML table to Markdown for better LLM readability
+                    try:
+                        from unstructured.cleaners.translate import translate_html_to_md
+                        table_md = translate_html_to_md(table_html)
+                        chunk_text = f"The following is a data table:\n\n{table_md}"
+                        element_chunks.append(chunk_text)
+                        logger.debug(f"Successfully processed a table on page {element.metadata.page_number}.")
+                    except ImportError:
+                        logger.warning("Could not import `translate_html_to_md`. Using raw table text. `pip install unstructured[md]` may be needed.")
+                        element_chunks.append(f"Data Table: {str(element)}")
                 
-                for j, chunk_text in enumerate(sub_chunks):
+                elif element_type == "Image":
+                    image_bytes = getattr(element, 'content', None)
+                    if image_bytes:
+                        prompt = "Analyze this image from a scientific paper on Carbon Nanotubes. Describe it in detail. What is being plotted? What are the axes? What is the key trend or feature shown? If it's a micrograph, describe the morphology."
+                        summary = embedding_interface.get_image_summary(image_bytes, prompt)
+                        if "LLM_ERROR" not in summary and "Unsupported" not in summary:
+                           chunk_text = f"The following is a description of a scientific image/plot:\n\n{summary}"
+                           element_chunks.append(chunk_text)
+                           logger.debug(f"Successfully summarized an image on page {element.metadata.page_number}.")
+                
+                else: # Default handling for text elements
+                    # Smart merging of titles/headers with the following text
+                    if element_type == "Title" or "Header" in element_type:
+                        if i + 1 < len(elements) and type(elements[i+1]).__name__ not in ["Table", "Image"]:
+                            elements[i+1].text = f"{str(element)}\n\n{str(elements[i+1])}"
+                        continue
+
+                    # Split longer text elements
+                    if len(str(element).strip()) > chunk_overlap:
+                        element_chunks.extend(text_splitter.split_text(str(element)))
+                    elif len(str(element).strip()) > 0:
+                        element_chunks.append(str(element))
+
+                # --- Process the generated chunks for this element ---
+                for j, chunk_text in enumerate(element_chunks):
                     cleaned_chunk = chunk_text.strip()
                     if len(cleaned_chunk) < config.MIN_CHUNK_LENGTH:
                         continue
 
                     chunk_id = _create_chunk_id(doc_name, i, j)
                     
-                    # Create rich metadata for each chunk
                     chunk_metadata = {
                         "document_name": doc_name,
                         "chunk_id": chunk_id,
-                        "element_type": element_type, # e.g., 'NarrativeText', 'ListItem'
+                        "element_type": element_type, # Now includes 'Table', 'Image'
                         "page_number": getattr(element.metadata, 'page_number', None)
                     }
 
-                    chunk_info = {
-                        "chunk_text": cleaned_chunk,
-                        "metadata": chunk_metadata
-                    }
-                    doc_chunks_for_kg.append(chunk_info)
+                    chunk_info = {"chunk_text": cleaned_chunk, "metadata": chunk_metadata}
+                    doc_all_chunks_for_kg.append(chunk_info)
                     all_final_chunks_for_vector_store.append(chunk_info)
             
-            # --- KG Population (Same as before, but with better chunks) ---
-            if doc_chunks_for_kg:
-                graph_db.add_document_and_chunks(doc_name, doc_chunks_for_kg)
-                logger.info(f"Extracting and linking entities for {len(doc_chunks_for_kg)} smart chunks from {doc_name}...")
-                for chunk in doc_chunks_for_kg:
+            # --- KG Population Step (works seamlessly with new chunk types) ---
+            if doc_all_chunks_for_kg:
+                # Add a 'type' property to the chunk node in the graph for better modeling
+                for chunk in doc_all_chunks_for_kg:
+                    chunk['metadata']['node_type'] = chunk['metadata']['element_type']
+
+                graph_db.add_document_and_chunks(doc_name, doc_all_chunks_for_kg)
+                logger.info(f"Extracting and linking entities for {len(doc_all_chunks_for_kg)} multi-modal chunks...")
+                for chunk in doc_all_chunks_for_kg:
                     entities = _extract_entities_from_chunk(chunk['chunk_text'], embedding_interface)
                     if entities:
                         graph_db.link_chunk_to_entities(chunk['metadata']['chunk_id'], entities)
 
         except Exception as e:
-            logger.exception(f"Failed to process file {doc_path} with `unstructured`: {e}")
+            logger.exception(f"Failed to process file {doc_path}: {e}")
             
-    logger.info(f"Finished parsing. Total smart chunks created for vector store: {len(all_final_chunks_for_vector_store)}")
+    logger.info(f"Finished multi-modal parsing. Total chunks for vector store: {len(all_final_chunks_for_vector_store)}")
     return all_final_chunks_for_vector_store
 
 

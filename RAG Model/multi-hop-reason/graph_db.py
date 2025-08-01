@@ -54,17 +54,26 @@ class Neo4jGraphDB:
                 raise
 
     def add_document_and_chunks(self, doc_name: str, chunks: List[Dict[str, Any]]):
-        """Adds a Document node and its associated Chunk nodes to the graph."""
+        """
+        Adds a Document node and its associated Chunk nodes to the graph,
+        including the chunk's element type as a property.
+        """
         query = """
-        MERGE (d:Document {name: $doc_name}) // Find or create the document node
+        MERGE (d:Document {name: $doc_name})
         WITH d
-        UNWIND $chunks as chunk_data // Process each chunk from the list
-        CREATE (c:Chunk {id: chunk_data.metadata.chunk_id, text: chunk_data.chunk_text})
+        UNWIND $chunks as chunk_data
+        // MERGE the chunk node based on its unique ID
+        MERGE (c:Chunk {id: chunk_data.metadata.chunk_id})
+        // ON CREATE sets properties only if the node is being created for the first time
+        ON CREATE SET
+            c.text = chunk_data.chunk_text,
+            c.type = chunk_data.metadata.element_type
+        // MERGE the relationship between the document and the chunk
         MERGE (d)-[:HAS_CHUNK]->(c)
         """
         parameters = {"doc_name": doc_name, "chunks": chunks}
         self.execute_query(query, parameters)
-        self.logger.info(f"Added/updated Document '{doc_name}' and its {len(chunks)} chunks in the graph.")
+        self.logger.info(f"Added/updated Document '{doc_name}' and its {len(chunks)} multi-modal chunks in the graph.")
 
     def link_chunk_to_entities(self, chunk_id: str, entities: List[Dict[str, str]]):
         """Links a chunk to extracted entities (e.g., Catalyst, Method)."""
