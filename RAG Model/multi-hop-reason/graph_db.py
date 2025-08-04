@@ -38,9 +38,28 @@ class Neo4jGraphDB:
                 session.run("CREATE CONSTRAINT document_name IF NOT EXISTS FOR (d:Document) REQUIRE d.name IS UNIQUE")
                 session.run("CREATE CONSTRAINT chunk_id IF NOT EXISTS FOR (c:Chunk) REQUIRE c.id IS UNIQUE")
                 session.run("CREATE CONSTRAINT entity_id IF NOT EXISTS FOR (e:Entity) REQUIRE e.id IS UNIQUE")
+                # --- NEW CONSTRAINT FOR AUTHORS ---
+                session.run("CREATE CONSTRAINT author_name IF NOT EXISTS FOR (a:Author) REQUIRE a.name IS UNIQUE")
                 self.logger.info("Ensured unique constraints on Document, Chunk, and Entity nodes.")
             except Exception as e:
                 self.logger.error(f"Error creating Neo4j constraints: {e}")
+
+    # --- NEW FUNCTION to link documents to authors ---
+    def link_document_to_authors(self, doc_name: str, authors: List[str]):
+        """Links a Document node to its Author nodes."""
+        if not authors:
+            return
+
+        query = """
+        MATCH (d:Document {name: $doc_name})
+        WITH d
+        UNWIND $authors as author_name
+        MERGE (a:Author {name: author_name})
+        MERGE (d)-[:AUTHORED_BY]->(a)
+        """
+        parameters = {"doc_name": doc_name, "authors": authors}
+        self.execute_query(query, parameters)
+        self.logger.info(f"Linked Document '{doc_name}' to {len(authors)} authors.")
 
     @retry(wait=wait_random_exponential(multiplier=1, min=2, max=30), stop=stop_after_attempt(3))
     def execute_query(self, query: str, parameters: Dict[str, Any] = None):
@@ -113,4 +132,21 @@ class Neo4jGraphDB:
         results = self.execute_query(query)
         chunk_ids = [record['chunkId'] for record in results]
         self.logger.info(f"KG query returned {len(chunk_ids)} chunk IDs.")
+        return chunk_ids
+    
+    def get_chunk_ids_for_document(self, doc_keyword: str) -> List[str]:
+        """Finds all chunk IDs belonging to documents whose names contain the keyword."""
+        if not doc_keyword:
+            return []
+            
+        # Using CONTAINS for flexible matching (e.g., "Pint" matches "pint-et-al-2009...")
+        query = """
+        MATCH (d:Document)-[:HAS_CHUNK]->(c:Chunk)
+        WHERE toLower(d.name) CONTAINS toLower($keyword)
+        RETURN c.id as chunkId
+        """
+        self.logger.info(f"Querying KG for chunks from documents containing keyword: '{doc_keyword}'")
+        results = self.execute_query(query, {"keyword": doc_keyword})
+        chunk_ids = [record['chunkId'] for record in results]
+        self.logger.info(f"KG document filter returned {len(chunk_ids)} chunk IDs.")
         return chunk_ids

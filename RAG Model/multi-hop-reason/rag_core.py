@@ -11,7 +11,7 @@ import config
 from llm_interface import LLMInterface
 from vector_store import VectorStore
 from evaluation import evaluate_response, assess_answer_confidence, record_feedback # Assuming this has the correct signature
-from utils import format_reasoning_trace, generate_hop_graph
+from utils import format_reasoning_trace, generate_hop_graph, prepare_interactive_graph_data
 from graph_db import Neo4jGraphDB # Import the graph DB class
 
 
@@ -235,11 +235,14 @@ class CNTRagSystem:
              self.logger.warning("LLM error during reasoning. Assuming ANSWER_COMPLETE.")
         else:
             response_clean = response_text.strip()
-            if re.fullmatch(r"ANSWER_COMPLETE", response_clean, re.IGNORECASE):
+            # --- THE FIX: Make parsing more robust ---
+            # Look for "ANSWER_COMPLETE" anywhere in the response, case-insensitive
+            if re.search(r"ANSWER_COMPLETE", response_clean, re.IGNORECASE):
                 action = "ANSWER_COMPLETE"; value = ""
                 self.logger.info(">>> Reasoning Decision: ANSWER_COMPLETE")
+            # Look for "NEXT_QUERY:" anywhere in the response, case-insensitive
             else:
-                match_next = re.fullmatch(r"NEXT_QUERY:\s*(.+)", response_clean, re.IGNORECASE | re.DOTALL)
+                match_next = re.search(r"NEXT_QUERY:\s*(.+)", response_clean, re.IGNORECASE | re.DOTALL)
                 if match_next:
                     new_query = match_next.group(1).strip()
                     if new_query:
@@ -253,6 +256,10 @@ class CNTRagSystem:
                     self.logger.warning(f"Unexpected reasoning response format: '{response_clean}'. Defaulting to ANSWER_COMPLETE.")
         return action, value
 
+    def get_chunk_by_id(self, chunk_id: str) -> Optional[Dict[str, Any]]:
+        """Pass-through method to get a chunk by its ID from the vector store."""
+        return self.vector_store.get_chunk_by_id(chunk_id)
+    
     def _format_context_from_chunks(self, chunks: List[Dict[str, Any]]) -> str:
         """Formats the retrieved chunks into a string for the LLM prompt, including detailed source."""
         if not chunks:
@@ -434,37 +441,36 @@ class CNTRagSystem:
     # --- NEW: Query Planner Function ---
     def _plan_query(self, query: str) -> Dict[str, Any]:
         """
-        Uses an LLM to deconstruct a query into a semantic query and metadata filters.
+        Deconstructs a query into a semantic query, metadata filters (with string values), and a document filter.
         """
         prompt = f"""
         You are an expert in Carbon Nanotube research. Analyze the user's query and break it down into a structured search plan.
-        The available entity types for filtering are: "Method", "Catalyst", "Substrate", "CNT_Type", "Carbon_Source".
+        The available entity types for filtering are: "Method", "Catalyst", "Substrate", "CNT_Type", "Enhancer".
+        You can also filter by a specific document if the user mentions one by name (e.g., "in the Pint et al. paper").
 
         User Query: "{query}"
 
-        Based on the query, generate a JSON object with two keys:
-        1. "semantic_query": A rephrased query for vector search, focusing on the core concepts.
-        2. "metadata_filters": A dictionary where keys are entity types and values are entity names. Only include filters explicitly mentioned.
+        Based on the query, generate a JSON object with three keys:
+        1. "semantic_query": A rephrased query for vector search.
+        2. "metadata_filters": A dictionary of entity filters. **IMPORTANT: The value for each filter must be a single string, not a list.** If multiple catalysts are mentioned, pick the most prominent one.
+        3. "document_filter": A string containing a keyword from a document's filename if mentioned (e.g., "Pint", "Oliver"), otherwise an empty string "".
 
         Example 1:
-        User Query: "How does fixed catalyst iron CVD impact MWCNT growth on silicon?"
+        User Query: "In the Pint et al. paper, what is the effect of water on growth?"
         Your JSON output:
         {{
-            "semantic_query": "growth dynamics and mechanisms of multi-walled carbon nanotubes using iron fixed catalyst CVD on silicon wafers",
-            "metadata_filters": {{
-                "Method": "CVD",
-                "Catalyst": "Iron",
-                "CNT_Type": "MWCNT",
-                "Substrate": "Silicon"
-            }}
+            "semantic_query": "effect of water on carbon nanotube growth",
+            "metadata_filters": {{"Enhancer": "Water"}},
+            "document_filter": "Pint"
         }}
 
         Example 2:
-        User Query: "Tell me about growing carbon nanotubes."
+        User Query: "How does iron and nickel CVD work?"
         Your JSON output:
         {{
-            "semantic_query": "general principles and techniques for growing carbon nanotubes",
-            "metadata_filters": {{}}
+            "semantic_query": "mechanism of iron and nickel catalyzed chemical vapor deposition for carbon nanotubes",
+            "metadata_filters": {{"Catalyst": "Iron", "Method": "CVD"}},
+            "document_filter": ""
         }}
 
         Now, analyze the following query and produce only the JSON output.
@@ -476,12 +482,25 @@ class CNTRagSystem:
         try:
             response_str = response_str.strip().replace("```json", "").replace("```", "").strip()
             plan = json.loads(response_str)
-            if isinstance(plan, dict) and "semantic_query" in plan and "metadata_filters" in plan:
+
+            # --- THE FIX: Validate and clean the metadata_filters ---
+            if isinstance(plan, dict) and "metadata_filters" in plan:
+                # Ensure all filter values are strings. If a list is returned, take the first element.
+                filters = plan["metadata_filters"]
+                for key, value in filters.items():
+                    if isinstance(value, list) and value:
+                        filters[key] = str(value[0]) # Take the first item and ensure it's a string
+                    elif not isinstance(value, str):
+                        filters[key] = str(value) # Coerce to string if not a string
+                plan["metadata_filters"] = filters
+
+            if isinstance(plan, dict) and "semantic_query" in plan and "metadata_filters" in plan and "document_filter" in plan:
                 return plan
         except (json.JSONDecodeError, TypeError):
             self.logger.warning(f"Failed to decode query plan. Using query as is. Raw: {response_str[:100]}...")
+
         # Fallback plan
-        return {"semantic_query": query, "metadata_filters": {}}
+        return {"semantic_query": query, "metadata_filters": {}, "document_filter": ""}
     
     # --- NEW: Query Router Function ---
     def _route_query(self, query: str) -> Dict[str, Any]:
@@ -534,7 +553,86 @@ class CNTRagSystem:
         # Fallback to a default strategy if parsing fails
         return {"strategy": "vector_search", "content": query}
     
-    
+    # --- NEW SUGGESTION GENERATION FUNCTION ---
+    def _generate_proactive_suggestions(self, context_sources: List[Dict[str, Any]]) -> str:
+        """
+        Generates suggestions in a prioritized order:
+        1. Other papers by the same authors.
+        2. Other authors who write about the same key topics.
+        3. At a minimum, lists the key authors from the current context.
+        """
+        if not context_sources:
+            return ""
+
+        source_doc_names = list(set([src.get("document_name") for src in context_sources if src.get("document_name")]))
+        chunk_ids = list(set([src.get("chunk_id") for src in context_sources if src.get("chunk_id")]))
+
+        if not source_doc_names or not chunk_ids:
+            return ""
+
+        # --- Tier 1: Find other papers by the same authors ---
+        query_authors = """
+        MATCH (d:Document)-[:AUTHORED_BY]->(a:Author)
+        WHERE d.name IN $source_doc_names
+        RETURN COLLECT(DISTINCT a.name) as authors
+        """
+        author_results = self.graph_db.execute_query(query_authors, {"source_doc_names": source_doc_names})
+        key_authors = author_results[0]['authors'] if author_results and author_results[0]['authors'] else []
+
+        suggested_papers = []
+        if key_authors:
+            query_other_papers = """
+            MATCH (a:Author)<-[:AUTHORED_BY]-(d:Document)
+            WHERE a.name IN $key_authors AND NOT d.name IN $source_doc_names
+            RETURN DISTINCT d.name as paper_name LIMIT 3
+            """
+            paper_results = self.graph_db.execute_query(query_other_papers, {
+                "key_authors": key_authors, "source_doc_names": source_doc_names
+            })
+            suggested_papers = [res['paper_name'] for res in paper_results]
+
+        # --- Tier 2: If no other papers found, find other authors on the same key topics ---
+        suggested_authors = set()
+        if not suggested_papers and key_authors: # Only run if Tier 1 failed
+            query_entities = """
+            MATCH (c:Chunk)-[:MENTIONS]->(e:Entity)
+            WHERE c.id IN $chunk_ids AND NOT e.type IN ['CNT_Type']
+            WITH e, count(c) as relevance
+            ORDER BY relevance DESC LIMIT 3
+            RETURN COLLECT(e.id) as entity_ids
+            """
+            entity_results = self.graph_db.execute_query(query_entities, {"chunk_ids": chunk_ids})
+            key_entity_ids = entity_results[0]['entity_ids'] if entity_results and entity_results[0]['entity_ids'] else []
+
+            if key_entity_ids:
+                query_other_authors = """
+                MATCH (e:Entity)<-[:MENTIONS]-(:Chunk)<-[:HAS_CHUNK]-(d:Document)-[:AUTHORED_BY]->(a:Author)
+                WHERE e.id IN $entity_ids AND NOT a.name IN $key_authors
+                RETURN a.name as author, count(DISTINCT e) as mentions
+                ORDER BY mentions DESC LIMIT 5
+                """
+                author_results = self.graph_db.execute_query(query_other_authors, {
+                    "entity_ids": key_entity_ids, "key_authors": key_authors
+                })
+                for res in author_results:
+                    suggested_authors.add(res['author'])
+
+        # --- Tier 3: Format the final output based on what was found ---
+        suggestions = []
+        if suggested_papers:
+            suggestions.append("**Explore other work from these authors:**")
+            for paper in suggested_papers:
+                suggestions.append(f"- *{paper}*")
+        elif suggested_authors:
+            suggestions.append(f"**Other key authors on related topics include:** {', '.join(list(suggested_authors))}.")
+        elif key_authors:
+            # Fallback: At the very least, list the authors of the current documents.
+            suggestions.append(f"**Key authors for this answer include:** {', '.join(key_authors)}.")
+
+        if not suggestions:
+            return ""
+
+        return "\n\n---\n**You might also be interested in:**\n" + "\n".join(suggestions)
     
     def process_query(self, question: str, top_k: int = config.DEFAULT_TOP_K, max_hops: int = config.DEFAULT_MAX_HOPS,
                         use_query_expansion: bool = False,
@@ -584,54 +682,58 @@ class CNTRagSystem:
 
             # --- AGENTIC ROUTER & RETRIEVAL LOGIC ---
             
-            # 1. Route the current query to decide on a retrieval strategy
+            # 1. Route the query (this part remains the same)
             route = self._route_query(current_query)
             strategy = route.get("strategy", "vector_search")
             semantic_query = route.get("content", current_query)
             reasoning_trace.append(f"Hop {hops_taken}: Routing -> Strategy='{strategy}', Query='{semantic_query[:100]}...'")
 
             retrieved_chunks: List[Dict[str, Any]] = []
-            
-            # 2. Execute the chosen strategy
-            if strategy == "hybrid_search":
-                # For hybrid search, we also need to plan the metadata filters
-                search_plan = self._plan_query(semantic_query) # _plan_query from previous step
-                metadata_filters = search_plan.get("metadata_filters", {})
-                reasoning_trace.append(f"Hop {hops_taken}: Hybrid Plan -> Filters={metadata_filters}")
-                
-                candidate_chunk_ids = []
-                if metadata_filters:
-                    candidate_chunk_ids = self.graph_db.get_chunk_ids_for_entities(metadata_filters)
-                    if not candidate_chunk_ids:
-                        reasoning_trace.append(f"Hop {hops_taken}: KG found no matching chunks for filters.")
-                    else:
-                        reasoning_trace.append(f"Hop {hops_taken}: KG pre-filtered to {len(candidate_chunk_ids)} candidate chunks.")
-
-                # Perform the vector search part of the hybrid search
-                query_embedding = self.llm_interface.get_embedding(semantic_query, task_type="RETRIEVAL_QUERY")
-                if query_embedding:
-                    all_retrieved = self.vector_store.query(query_embedding, top_k=top_k * 5) # Retrieve more for better filtering
-                    if candidate_chunk_ids:
-                        retrieved_chunks = [c for c in all_retrieved if c.get("id") in candidate_chunk_ids][:top_k]
-                    else:
-                        retrieved_chunks = all_retrieved[:top_k]
-            
-            else: # strategy == "vector_search"
-                reasoning_trace.append(f"Hop {hops_taken}: Executing pure vector search.")
-                query_embedding = self.llm_interface.get_embedding(semantic_query, task_type="RETRIEVAL_QUERY")
-                if query_embedding:
-                    retrieved_chunks = self.vector_store.query(query_embedding, top_k=top_k)
-
-            # 3. Process the results of whichever strategy was used
             retrieval_succeeded_this_hop = False
-            if not retrieved_chunks:
-                self.logger.warning(f"Retrieval (strategy: {strategy}) returned no chunks for hop {hops_taken}.")
-                reasoning_trace.append(f"Hop {hops_taken}: Retrieval yielded no results.")
-            else:
-                self.logger.info(f"Retrieval (strategy: {strategy}) found {len(retrieved_chunks)} chunks.")
-                top_score_str = f"{retrieved_chunks[0]['score']:.4f}" if retrieved_chunks else "N/A"
-                reasoning_trace.append(f"Hop {hops_taken}: Retrieved {len(retrieved_chunks)} chunk(s). Top score: {top_score_str}")
-                retrieval_succeeded_this_hop = True
+
+            # 2. Plan the query to get filters
+            search_plan = self._plan_query(semantic_query)
+            metadata_filters = search_plan.get("metadata_filters", {})
+            document_filter = search_plan.get("document_filter", "")
+            reasoning_trace.append(f"Hop {hops_taken}: Plan -> DocFilter='{document_filter}', MetaFilters={metadata_filters}")
+
+            # 3. Apply filters to get a candidate set of chunk IDs
+            doc_chunk_ids = []
+            if document_filter:
+                doc_chunk_ids = self.graph_db.get_chunk_ids_for_document(document_filter)
+                if not doc_chunk_ids:
+                    # If the user specified a doc but it's not found, we should probably stop and say so.
+                    self.logger.warning(f"Document filter '{document_filter}' yielded no results from KG.")
+                    # We will let the process continue to see if vector search can find it, but this is a key debug signal.
+
+            entity_chunk_ids = []
+            if metadata_filters:
+                entity_chunk_ids = self.graph_db.get_chunk_ids_for_entities(metadata_filters)
+
+            # Determine the final candidate set by intersecting the filter results
+            candidate_chunk_ids = []
+            if document_filter and metadata_filters:
+                candidate_chunk_ids = list(set(doc_chunk_ids) & set(entity_chunk_ids))
+                reasoning_trace.append(f"Hop {hops_taken}: KG candidates from Doc+Meta intersection: {len(candidate_chunk_ids)}")
+            elif document_filter:
+                candidate_chunk_ids = doc_chunk_ids
+                reasoning_trace.append(f"Hop {hops_taken}: KG candidates from Doc filter: {len(candidate_chunk_ids)}")
+            elif metadata_filters:
+                candidate_chunk_ids = entity_chunk_ids
+                reasoning_trace.append(f"Hop {hops_taken}: KG candidates from Meta filter: {len(candidate_chunk_ids)}")
+            
+            # 4. Execute retrieval strategy
+            query_embedding = self.llm_interface.get_embedding(semantic_query, task_type="RETRIEVAL_QUERY")
+            if query_embedding:
+                # Always retrieve from the full vector store
+                all_retrieved = self.vector_store.query(query_embedding, top_k=top_k * 5)
+                
+                # If we have a candidate set from the KG, filter the vector results
+                if candidate_chunk_ids:
+                    retrieved_chunks = [c for c in all_retrieved if c.get("id") in candidate_chunk_ids][:top_k]
+                else:
+                    # If there are no KG candidates (e.g., pure vector search route), use the top results
+                    retrieved_chunks = all_retrieved[:top_k]
 
             # --- REMAINDER OF THE LOOP IS THE SAME ---
             
@@ -708,8 +810,10 @@ class CNTRagSystem:
         
         graph_filename = None
         if generate_graph:
-            graph_filename = generate_hop_graph(reasoning_trace, graph_query_history, self.graph_dir, self.logger)
-
+            # graph_filename = generate_hop_graph(reasoning_trace, graph_query_history, self.graph_dir, self.logger)
+            graph_data = prepare_interactive_graph_data(reasoning_trace, graph_query_history)
+            
+        proactive_suggestions = self._generate_proactive_suggestions(final_context_sources)
         process_end_time = time.time()
         processing_time = process_end_time - process_start_time
         self.logger.info(f"--- CNT Query Process Finished ---")
@@ -751,9 +855,11 @@ class CNTRagSystem:
         return {
             "final_answer": final_answer,
             "retrieved_sources": final_context_sources,
+            "proactive_suggestions": proactive_suggestions, # <-- ADD THIS NEW KEY
             "source_info": f"Synthesized from context (KG+VDB, Strategy: {strategy}) over {hops_taken} hop(s).",
             "reasoning_trace": reasoning_trace,
             "formatted_reasoning": formatted_reasoning,
+            "graph_data": graph_data,
             "confidence_score": confidence_score,
             "evaluation_metrics": evaluation_metrics,
             "debug_info": debug_info

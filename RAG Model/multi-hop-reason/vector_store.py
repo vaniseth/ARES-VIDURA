@@ -156,6 +156,28 @@ class PandasVectorStore(VectorStore):
         except Exception as e:
             self.logger.exception(f"Unexpected error during CSV DB loading: {e}"); self.vector_db_df = None; return False
 
+    def get_chunk_by_id(self, chunk_id: str) -> Optional[Dict[str, Any]]:
+        """Retrieves a single, complete chunk dictionary by its unique chunk_id."""
+        if self.vector_db_df is None or self.vector_db_df.empty:
+            self.logger.warning("Cannot get chunk by ID, DataFrame is not loaded.")
+            return None
+        
+        try:
+            # Find the row where the chunk_id in the metadata dictionary matches.
+            # This is not the most performant way for huge dataframes, but effective.
+            # A better long-term solution would be to set the chunk_id as the DataFrame index.
+            mask = self.vector_db_df['metadata'].apply(lambda meta: isinstance(meta, dict) and meta.get('chunk_id') == chunk_id)
+            result_df = self.vector_db_df.loc[mask]
+
+            if not result_df.empty:
+                # Return the first match as a dictionary
+                return result_df.iloc[0].to_dict()
+            else:
+                self.logger.warning(f"No chunk found with ID: {chunk_id}")
+                return None
+        except Exception as e:
+            self.logger.error(f"Error retrieving chunk by ID '{chunk_id}': {e}")
+            return None
 
     def load_or_build(self,
                       documents_path_pattern: str,

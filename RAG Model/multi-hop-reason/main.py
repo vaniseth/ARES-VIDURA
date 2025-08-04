@@ -42,6 +42,11 @@ def run_test_query(rag_system: CNTRagSystem, question: str, index: int, user_typ
 
     print("\n--- Final Answer ---")
     print(results.get("final_answer", "N/A"))
+    
+    # --- NEW: Print Proactive Suggestions ---
+    suggestions = results.get("proactive_suggestions")
+    if suggestions:
+        print(suggestions) # The suggestions string is already formatted
 
     print("\n--- Detailed Sources Used for Final Context ---")
     retrieved_sources = results.get("retrieved_sources")

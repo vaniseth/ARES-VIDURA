@@ -68,53 +68,76 @@ def _elements_to_dicts(elements: List[Any], doc_name: str, doc_path: str) -> Lis
 # --- NEW FUNCTION: To extract entities using an LLM ---
 def _extract_entities_from_chunk(chunk_text: str, llm_interface: LLMInterface) -> List[Dict[str, str]]:
     """
-    Uses an LLM to extract key scientific entities from a text chunk.
+    Uses an LLM to extract key scientific entities from a text chunk with normalization.
     """
     prompt = f"""
-    From the following scientific text about Carbon Nanotubes, extract key entities.
-    The entity types to extract are: "Method", "Catalyst", "Substrate", "CNT_Type", "Carbon_Source".
-    - "Method": e.g., 'CVD', 'Laser Ablation', 'Arc Discharge', 'Plasma Enhanced CVD', 'Fixed Catalyst', 'Floating Catalyst'
-    - "Catalyst": e.g., 'Iron', 'Nickel', 'Fe', 'Ni', 'Gadolinium'
-    - "Substrate": e.g., 'Silicon', 'Graphite', 'Alumina', 'Magnesium Aluminate'
-    - "CNT_Type": e.g., 'SWCNT', 'MWCNT', 'Single-walled', 'Multi-walled'
-    - "Carbon_Source": e.g., 'Acetylene', 'Methane', 'Ethylene', 'C2H2', 'C2H4'
+    From the scientific text on Carbon Nanotubes below, extract key entities of types: "Method", "Catalyst", "Substrate", "CNT_Type", "Enhancer".
+    - "Method": e.g., 'CVD', 'Laser Ablation', 'Vertically Aligned', 'Floating Catalyst'.
+    - "Catalyst": e.g., 'Iron', 'Nickel', 'Fe', 'Ni', 'Cobalt'.
+    - "Substrate": e.g., 'Silicon', 'Graphite', 'Alumina'.
+    - "CNT_Type": e.g., 'SWCNT', 'MWCNT', 'Single-walled'.
+    - "Enhancer": e.g., 'Water', 'H2O', 'CO2', 'Oxygen', 'Ammonia'.
 
-    Return the results as a JSON list of objects, where each object has a "type" and "name".
-    If no entities are found, return an empty list [].
+    IMPORTANT INSTRUCTIONS:
+    1. Normalize common names: 'Fe' -> 'Iron', 'Ni' -> 'Nickel', 'H2O' -> 'Water', 'single-walled' -> 'SWCNT', 'multi-walled' -> 'MWCNT'.
+    2. Return the results as a valid JSON list of objects, where each object has a "type" and "name".
+    3. If no entities are found, you MUST return an empty list [].
 
-    Example:
-    Text: "We grew MWCNTs on a silicon substrate using a fixed iron catalyst via the CVD method with acetylene gas."
-    Output:
-    [
-        {{"type": "CNT_Type", "name": "MWCNT"}},
-        {{"type": "Substrate", "name": "Silicon"}},
-        {{"type": "Catalyst", "name": "Iron"}},
-        {{"type": "Method", "name": "Fixed Catalyst"}},
-        {{"type": "Method", "name": "CVD"}},
-        {{"type": "Carbon_Source", "name": "Acetylene"}}
-    ]
-
-    Now, analyze this text:
-    --- TEXT START ---
+    Text:
+    ---
     {chunk_text}
-    --- TEXT END ---
+    ---
 
     JSON Output:
     """
     response_str = llm_interface.generate_response(prompt)
     try:
-        # Basic cleanup in case LLM adds markdown backticks
         response_str = response_str.strip().replace("```json", "").replace("```", "").strip()
         entities = json.loads(response_str)
         if isinstance(entities, list):
-            # Validate structure
             validated_entities = [e for e in entities if isinstance(e, dict) and "type" in e and "name" in e]
             return validated_entities
         return []
     except (json.JSONDecodeError, TypeError):
-        logger.warning(f"Failed to decode LLM response into JSON for entity extraction. Raw response: {response_str[:100]}...")
+        logger.warning(f"Failed to decode LLM response for entity extraction. Raw: {response_str[:100]}...")
         return []
 
+def _extract_authors_from_document(doc_text_snippet: str, llm_interface: LLMInterface) -> List[str]:
+    """
+    Uses an LLM to extract author names from the beginning of a document.
+    """
+    if not doc_text_snippet.strip():
+        return []
+        
+    prompt = f"""
+    Your task is to act as an expert librarian. From the following text, which represents the first page of a scientific paper, your sole job is to extract the author names.
+
+    RULES:
+    - Author names are typically located between the paper title and the abstract or introduction.
+    - Ignore affiliations, journal names, keywords, and any other text.
+    - Handle complex names and initials (e.g., "A. John Hart", "Yoeri van de Burgt").
+    - Return the names as a clean JSON list of strings. Example: ["C. Ryan Oliver", "Erik S. Polsen", "A. John Hart"].
+    - If you cannot find any author names, you MUST return an empty list: [].
+
+    Analyze this text snippet:
+    ---
+    {doc_text_snippet}
+    ---
+
+    JSON list of author names:
+    """
+    response_str = llm_interface.generate_response(prompt)
+    try:
+        # Basic cleanup
+        response_str = response_str.strip().replace("```json", "").replace("```", "").strip()
+        authors = json.loads(response_str)
+        if isinstance(authors, list) and all(isinstance(a, str) for a in authors):
+            return authors
+        return []
+    except (json.JSONDecodeError, TypeError):
+        logger.warning(f"Failed to decode LLM response into JSON for author extraction. Raw: {response_str[:100]}...")
+        return []
+    
 # This is a new helper function for our smart chunking
 def _create_chunk_id(doc_name: str, element_idx: int, chunk_idx: int) -> str:
     """Creates a unique ID for a chunk based on its document and position."""
@@ -158,6 +181,27 @@ def parse_and_chunk_documents(
             # elements = partition(filename=doc_path, strategy="hi_res", infer_table_structure=True)
             # The new line using a more direct strategy
             elements = partition(filename=doc_path, strategy="fast")
+            
+            # --- NEW AUTHOR EXTRACTION LOGIC ---
+            # Concatenate the text from the first few elements to find authors
+            doc_beginning_text = "\n".join([str(el) for el in elements[:10]]) # Use first 5 elements as context
+            
+            # --- START OF DEBUG BLOCK ---
+            print("="*50)
+            print(f"DEBUG: Analyzing snippet for authors from {doc_name}:")
+            print(doc_beginning_text[:500] + "...") # Print the first 500 chars of the snippet
+            # --- END OF DEBUG BLOCK ---
+        
+            authors = _extract_authors_from_document(doc_beginning_text, embedding_interface)
+            
+            # --- START OF DEBUG BLOCK ---
+            print(f"DEBUG: LLM returned authors: {authors}")
+            # --- END OF DEBUG BLOCK ---
+            
+            if authors:
+                logger.info(f"Extracted {len(authors)} authors from {doc_name}: {authors}")
+                # We will link them to the document in the KG (see Step 2)
+            # --- END OF NEW LOGIC ---
             
             doc_all_chunks_for_kg = []
             
@@ -227,6 +271,10 @@ def parse_and_chunk_documents(
                     chunk['metadata']['node_type'] = chunk['metadata']['element_type']
 
                 graph_db.add_document_and_chunks(doc_name, doc_all_chunks_for_kg)
+                # --- NEW: Link document to extracted authors ---
+                if authors:
+                    graph_db.link_document_to_authors(doc_name, authors)
+                
                 logger.info(f"Extracting and linking entities for {len(doc_all_chunks_for_kg)} multi-modal chunks...")
                 for chunk in doc_all_chunks_for_kg:
                     entities = _extract_entities_from_chunk(chunk['chunk_text'], embedding_interface)
