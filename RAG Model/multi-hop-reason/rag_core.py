@@ -502,6 +502,62 @@ class CNTRagSystem:
         # Fallback plan
         return {"semantic_query": query, "metadata_filters": {}, "document_filter": ""}
     
+    def _execute_retrieval_strategy(self, strategy: str, semantic_query: str, top_k: int) -> List[Dict[str, Any]]:
+        """
+        Executes the chosen retrieval strategy (hybrid or vector) and returns the retrieved chunks.
+        This is a refactoring of the retrieval logic from the original process_query function.
+        """
+        self.logger.info(f"Executing retrieval with strategy: '{strategy}'")
+        retrieved_chunks: List[Dict[str, Any]] = []
+
+        if strategy == "hybrid_search":
+            # For hybrid search, we need to plan metadata filters
+            search_plan = self._plan_query(semantic_query)
+            metadata_filters = search_plan.get("metadata_filters", {})
+            document_filter = search_plan.get("document_filter", "")
+            self.logger.info(f"Hybrid Plan -> DocFilter='{document_filter}', MetaFilters={metadata_filters}")
+
+            # Apply filters to get a candidate set of chunk IDs from the KG
+            doc_chunk_ids = []
+            if document_filter:
+                doc_chunk_ids = self.graph_db.get_chunk_ids_for_document(document_filter)
+
+            entity_chunk_ids = []
+            if metadata_filters:
+                entity_chunk_ids = self.graph_db.get_chunk_ids_for_entities(metadata_filters)
+
+            # Determine the final candidate set by intersecting the filter results
+            candidate_chunk_ids = []
+            if document_filter and metadata_filters:
+                candidate_chunk_ids = list(set(doc_chunk_ids) & set(entity_chunk_ids))
+                self.logger.info(f"KG candidates from Doc+Meta intersection: {len(candidate_chunk_ids)}")
+            elif document_filter:
+                candidate_chunk_ids = doc_chunk_ids
+                self.logger.info(f"KG candidates from Doc filter: {len(candidate_chunk_ids)}")
+            elif metadata_filters:
+                candidate_chunk_ids = entity_chunk_ids
+                self.logger.info(f"KG candidates from Meta filter: {len(candidate_chunk_ids)}")
+            
+            # Perform the vector search part of the hybrid search
+            query_embedding = self.llm_interface.get_embedding(semantic_query, task_type="RETRIEVAL_QUERY")
+            if query_embedding:
+                all_retrieved = self.vector_store.query(query_embedding, top_k=top_k * 5)
+                
+                # If we have a candidate set from the KG, filter the vector results
+                if candidate_chunk_ids:
+                    retrieved_chunks = [c for c in all_retrieved if c.get("id") in candidate_chunk_ids][:top_k]
+                else:
+                    # If the planner specified hybrid but found no KG candidates, fall back to pure vector search
+                    retrieved_chunks = all_retrieved[:top_k]
+        
+        else:  # strategy == "vector_search"
+            self.logger.info("Executing pure vector search.")
+            query_embedding = self.llm_interface.get_embedding(semantic_query, task_type="RETRIEVAL_QUERY")
+            if query_embedding:
+                retrieved_chunks = self.vector_store.query(query_embedding, top_k=top_k)
+
+        return retrieved_chunks
+    
     # --- NEW: Query Router Function ---
     def _route_query(self, query: str) -> Dict[str, Any]:
         """
@@ -864,3 +920,112 @@ class CNTRagSystem:
             "evaluation_metrics": evaluation_metrics,
             "debug_info": debug_info
         }
+        
+    # for live streaming
+    # This is a NEW, streaming version of the function.
+    def stream_query_process(self, question: str, top_k: int = config.DEFAULT_TOP_K, max_hops: int = config.DEFAULT_MAX_HOPS, use_query_expansion: bool = True):
+        """
+        Processes a query as a generator, yielding detailed, human-readable trace updates at each step.
+        """
+        process_start_time = time.time()
+        # Expose these lists so the app can access them later for the graph
+        self.reasoning_trace = []
+        self.search_query_history = []
+
+        if not self.vector_store.is_ready():
+            yield {"event": "error", "data": "Knowledge base not available."}
+            return
+
+        original_query = question
+        current_query = self._transform_query(original_query)
+        
+        # Initialize lists
+        accumulated_context_list: List[str] = []
+        self.search_query_history.append(current_query)
+        graph_query_history = [current_query] # For reasoning context
+        final_context_sources: List[Dict[str, Any]] = []
+        unique_chunk_ids_in_context = set()
+
+        # Initial trace event
+        trace_line = "START"
+        self.reasoning_trace.append(trace_line)
+        yield {"event": "trace", "data": trace_line}
+
+        if use_query_expansion:
+            yield {"event": "status", "data": "Expanding initial query..."}
+            expanded_queries = self._expand_query(current_query, num_expansions=2)
+            if expanded_queries:
+                current_query = expanded_queries[0]
+                self.search_query_history = list(dict.fromkeys(expanded_queries))
+                graph_query_history = list(dict.fromkeys(expanded_queries))
+                trace_line = f"Initial Expanded Queries: {expanded_queries}"
+                self.reasoning_trace.append(trace_line)
+                yield {"event": "trace", "data": trace_line}
+
+        for hop in range(max_hops):
+            hops_taken = hop + 1
+            trace_line = f"--- Hop {hops_taken} ---"
+            self.reasoning_trace.append(trace_line)
+            yield {"event": "trace", "data": trace_line}
+            
+            # --- All retrieval logic is now encapsulated ---
+            route = self._route_query(current_query)
+            strategy = route.get("strategy", "vector_search")
+            semantic_query = route.get("content", current_query)
+
+            trace_line = f"Retrieving with query -> '{semantic_query}'"
+            self.reasoning_trace.append(trace_line)
+            yield {"event": "trace", "data": trace_line}
+            yield {"event": "status", "data": f"Hop {hops_taken}: Retrieving with '{strategy}'..."}
+
+            retrieved_chunks = self._execute_retrieval_strategy(strategy, semantic_query, top_k)
+            
+            # --- Correctly populate sources as they are found ---
+            accumulated_context_list, added_unique_chunks_dicts = self._manage_context(accumulated_context_list, retrieved_chunks, original_query)
+            if added_unique_chunks_dicts:
+                for chunk_data in added_unique_chunks_dicts:
+                    chunk_id = chunk_data.get('id')
+                    if chunk_id and chunk_id not in unique_chunk_ids_in_context:
+                        source_info = {
+                            "document_name": chunk_data.get("metadata", {}).get("document_name", "N/A"),
+                            "page_number": chunk_data.get("metadata", {}).get("page_number", "N/A"),
+                            "chunk_id": chunk_id,
+                            "retrieval_score": chunk_data.get("score", 0.0),
+                            "text_snippet": chunk_data.get("text", "")[:150] + "..."
+                        }
+                        final_context_sources.append(source_info)
+                        unique_chunk_ids_in_context.add(chunk_id)
+
+            top_score_str = f"{retrieved_chunks[0]['score']:.4f}" if retrieved_chunks else "N/A"
+            trace_line = f"Retrieved {len(retrieved_chunks)} chunk(s). Top score: {top_score_str}"
+            self.reasoning_trace.append(trace_line)
+            yield {"event": "trace", "data": trace_line}
+
+            yield {"event": "status", "data": f"Hop {hops_taken}: Reasoning on context..."}
+            full_context = "\n\n".join(accumulated_context_list)
+            action, value = self._reason_and_refine_query(original_query, full_context, graph_query_history, hops_taken, not retrieved_chunks)
+            
+            trace_line = f"Reasoning result -> Action='{action}', Value='{value[:100]}...'"
+            self.reasoning_trace.append(trace_line)
+            yield {"event": "trace", "data": trace_line}
+
+            if action == "ANSWER_COMPLETE":
+                break
+            elif action == "NEXT_QUERY":
+                current_query = self._transform_query(value)
+                self.search_query_history.append(current_query)
+                graph_query_history.append(current_query)
+            else:
+                break
+                
+        yield {"event": "status", "data": "Synthesizing final answer..."}
+        final_answer = self._generate_final_answer(original_query, accumulated_context_list)
+        yield {"event": "final_answer", "data": final_answer}
+        
+        yield {"event": "status", "data": "Generating suggestions..."}
+        suggestions = self._generate_proactive_suggestions(final_context_sources)
+        yield {"event": "suggestions", "data": suggestions}
+        yield {"event": "sources", "data": final_context_sources}
+        
+        processing_time = time.time() - process_start_time
+        yield {"event": "done", "data": f"Process finished in {processing_time:.2f}s"}

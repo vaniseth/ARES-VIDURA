@@ -1,14 +1,14 @@
-# app.py (Final Polished Version)
+# app.py (Final Polished Version with UI bug fix)
 import streamlit as st
 import os
-import re # Import re for the utility function
-import textwrap # Import textwrap for the utility function
+import re
+import textwrap
 from typing import List, Dict, Any
 
 from streamlit_agraph import agraph, Node, Edge, Config
 
 import config
-from utils import setup_logging
+from utils import setup_logging, format_reasoning_trace, prepare_interactive_graph_data
 from llm_interface import LLMInterface
 from vector_store import get_vector_store
 from graph_db import Neo4jGraphDB
@@ -20,45 +20,11 @@ st.set_page_config(page_title="CNT Research Assistant", layout="wide")
 st.title("🔬 CNT Research Assistant")
 st.info("Ask a question about Carbon Nanotubes. Expand the 'Details' section under each answer to verify sources and reasoning.")
 
-# --- Utility Function ---
-# (Moved prepare_interactive_graph_data here to make app.py self-contained for UI logic)
-def prepare_interactive_graph_data(reasoning_trace: List[str], query_history: List[str]) -> dict:
-    nodes, edges = [], []
-    def wrap_text(text, width=30): return '\n'.join(textwrap.wrap(text, width=width))
-    start_query = query_history[0] if query_history else "Initial Query"
-    nodes.append(Node(id='start', label=f"Start\n{wrap_text(start_query)}", shape='diamond', color='#ADD8E6'))
-    last_node_id = 'start'
-    hop_num, query_idx = 0, 0
-    processed_reasoning_nodes = set()
-    for step in reasoning_trace:
-        if step.startswith("--- Hop"):
-            hop_num = int(re.search(r'\d+', step).group())
-            query_text = query_history[query_idx] if query_idx < len(query_history) else f"Query for Hop {hop_num}"
-            query_node_id = f"query_{hop_num}"
-            nodes.append(Node(id=query_node_id, label=f"Hop {hop_num} Query\n{wrap_text(query_text)}", color='#90EE90'))
-            edges.append(Edge(source=last_node_id, target=query_node_id, label=f"Refine (Hop {hop_num})"))
-            last_node_id = query_node_id
-            if any(f"Hop {hop_num}: Reasoning -> NEXT_QUERY" in s for s in reasoning_trace if s.startswith(f"Hop {hop_num}")):
-                query_idx = min(query_idx + 1, len(query_history) - 1)
-        elif "Reasoning result" in step:
-            reasoning_node_id = f"reasoning_{hop_num}"
-            if reasoning_node_id not in processed_reasoning_nodes:
-                action_match = re.search(r"Action='([^']*)'", step)
-                value_match = re.search(r"Value='([^']*)", step)
-                action = action_match.group(1) if action_match else "N/A"
-                value = value_match.group(1).replace("'...", "") if value_match else "N/A"
-                nodes.append(Node(id=reasoning_node_id, label=f"Hop {hop_num} Reasoning\nAction: {action}\nValue: {wrap_text(value)}", color='#FFFFE0', shape='ellipse'))
-                edges.append(Edge(source=last_node_id, target=reasoning_node_id, label="Process Context"))
-                last_node_id = reasoning_node_id
-                processed_reasoning_nodes.add(reasoning_node_id)
-    nodes.append(Node(id='final_answer', label='Final Answer Generation', shape='octagon', color='#FFA500'))
-    edges.append(Edge(source=last_node_id, target='final_answer', label="Proceed to Final"))
-    return {"nodes": nodes, "edges": edges}
-
 # --- Initialization & Caching ---
 @st.cache_resource
 def load_rag_system():
     # ... (This entire function remains the same as your working version)
+    # ... (No changes needed here)
     log_dir = os.path.dirname(config.DEFAULT_LOG_FILE_PATH)
     if log_dir and not os.path.exists(log_dir):
         os.makedirs(log_dir)
@@ -69,7 +35,8 @@ def load_rag_system():
         graph_db = Neo4jGraphDB(logger=logger)
         vector_store = get_vector_store(vector_db_type=config.DEFAULT_VECTOR_DB_TYPE, vector_db_path=config.DEFAULT_VECTOR_DB_PATH, logger=logger)
         chunk_settings = {'size': config.DEFAULT_CHUNK_SIZE, 'overlap': config.DEFAULT_CHUNK_OVERLAP}
-        build_success = vector_store.load_or_build(documents_path_pattern=config.DEFAULT_DOCUMENTS_PATH_PATTERN, chunk_settings=chunk_settings, embedding_interface=llm_interface, graph_db=graph_db)
+        with st.spinner("Loading knowledge base... This may take a moment on first run."):
+            build_success = vector_store.load_or_build(documents_path_pattern=config.DEFAULT_DOCUMENTS_PATH_PATTERN, chunk_settings=chunk_settings, embedding_interface=llm_interface, graph_db=graph_db)
         if not build_success or not vector_store.is_ready():
              logger.critical("Vector store initialization failed.")
              st.error("Fatal Error: The knowledge base could not be loaded. Please check the logs.")
@@ -89,7 +56,7 @@ rag_system = load_rag_system()
 
 # --- UI Helper Functions ---
 def display_sources(sources, message_key):
-    # ... (This function remains the same as your working version)
+    # ... (This function remains unchanged)
     if not sources:
         st.caption("No specific sources were cited for this response.")
         return
@@ -112,6 +79,7 @@ def display_sources(sources, message_key):
 
 @st.dialog("Interactive Reasoning Flow")
 def show_graph_dialog(graph_data):
+    # ... (This function remains unchanged)
     st.info("You can drag nodes to rearrange the graph and use your mouse wheel to zoom.")
     if graph_data:
         config = Config(width=800, height=600, directed=True, physics=False, hierarchical={"enabled": True, "sortMethod": "directed", "shakeTowards": "roots"}, node={'size': 25, 'font': {'size': 12}}, edge={'font': {'align': 'top'}})
@@ -119,67 +87,112 @@ def show_graph_dialog(graph_data):
 
 # --- Chat History Management ---
 if "messages" not in st.session_state:
-    st.session_state.messages = [{"role": "assistant", "content": "Hello! I am a specialized research assistant for Carbon Nanotubes. How can I help you today?", "sources": [], "reasoning": "Initial greeting.", "graph_data": None}]
+    st.session_state.messages = [{"role": "assistant", "content": "Hello! How can I help you today?", "reasoning": "Initial greeting."}]
 
-# Display past messages
+# Display all historical messages
 for i, message in enumerate(st.session_state.messages):
     with st.chat_message(message["role"]):
         st.markdown(message["content"])
         if message["role"] == "assistant":
-            # --- THE FIX: Use an expander that contains the tabs ---
-            with st.expander("Show Details (Sources, Reasoning, Flow)"):
-                source_tab, reasoning_tab, graph_tab = st.tabs(["🔬 Sources", "🧠 Reasoning Text", "📈 Reasoning Flow"])
+            with st.expander("Show Details"):
+                source_tab, reasoning_tab, graph_tab = st.tabs(["🔬 Sources", "🧠 Reasoning", "📈 Flow"])
                 with source_tab:
                     display_sources(message.get("sources", []), f"msg_{i}")
                 with reasoning_tab:
-                    st.text(message.get("reasoning", "No reasoning trace available."))
+                    st.text(message.get("reasoning", "No trace available."))
                 with graph_tab:
                     if message.get("graph_data"):
-                        if st.button("Launch Interactive Graph", key=f"graph_btn_{i}"):
+                        if st.button("Launch Graph", key=f"graph_btn_{i}"):
                             show_graph_dialog(message.get("graph_data"))
-                    else:
-                        st.caption("Graph data not generated for this response.")
 
 # --- Main Chat Logic ---
 if rag_system:
     if prompt := st.chat_input("Ask your question about CNTs..."):
+        # Add user message to state and display it
         st.session_state.messages.append({"role": "user", "content": prompt})
-        st.rerun() # Rerun to immediately display the user's message
-
-    # Process the last user message if it hasn't been processed yet
-    last_message = st.session_state.messages[-1]
-    if last_message["role"] == "user" and "processed" not in last_message:
         
+        # Display the user's message immediately
+        with st.chat_message("user"):
+            st.markdown(prompt)
+
+        # Generate and stream the assistant's response
         with st.chat_message("assistant"):
-            with st.spinner("Thinking, analyzing, and retrieving..."):
+            # Main placeholder for the answer
+            answer_placeholder = st.empty()
+            
+            # --- THE FIX: We create the final expander and tabs from the start ---
+            with st.expander("Show Details (Live)", expanded=True) as details_expander:
+                source_tab, reasoning_tab, graph_tab = st.tabs(["🔬 Sources", "🧠 Reasoning Text", "📈 Reasoning Flow"])
+                
+                # Placeholders within each tab
+                with source_tab:
+                    source_placeholder = st.empty()
+                with reasoning_tab:
+                    reasoning_placeholder = st.empty()
+                with graph_tab:
+                    graph_placeholder = st.empty()
+
+            # Initialize variables
+            final_answer, suggestions, sources = "", "", []
+            live_trace = []
+            
+            try:
                 contextual_query = rag_system.generate_contextual_query(
-                    chat_history=st.session_state.messages[:-1], # Don't include the current question
-                    new_question=last_message["content"]
+                    chat_history=st.session_state.messages[:-1], 
+                    new_question=prompt
                 )
                 
-                response_data = rag_system.process_query(
-                    question=contextual_query,
-                    top_k=config.DEFAULT_TOP_K,
-                    max_hops=config.DEFAULT_MAX_HOPS,
-                    use_query_expansion=True,
-                    request_evaluation=False,
-                    generate_graph=True # IMPORTANT: This must be True
-                )
+                # Stream events from the RAG system
+                for event in rag_system.stream_query_process(question=contextual_query):
+                    event_type, data = event.get("event"), event.get("data")
 
-                graph_data = prepare_interactive_graph_data(
-                    response_data.get("reasoning_trace", []),
-                    response_data.get("debug_info", {}).get("queries_used", [])
-                ) if response_data.get("reasoning_trace") else None
+                    if event_type == "trace":
+                        live_trace.append(data)
+                        reasoning_placeholder.text(format_reasoning_trace(live_trace))
+                    
+                    elif event_type == "final_answer":
+                        final_answer = data
+                        answer_placeholder.markdown(final_answer)
+                    
+                    elif event_type == "suggestions":
+                        suggestions = data
+                        answer_placeholder.markdown(final_answer + suggestions)
+                    
+                    elif event_type == "sources":
+                        sources = data
+                        with source_placeholder.container():
+                            # Use a unique key for the live message's sources
+                            display_sources(sources, f"msg_live_{len(st.session_state.messages)}")
+                    
+                    elif event_type == "done":
+                        break
+                
+                # After the loop, prepare the final data to be stored
+                full_response_content = final_answer + suggestions
+                final_formatted_trace = format_reasoning_trace(live_trace)
+                
+                query_history = getattr(rag_system, 'search_query_history', [])
+                graph_data = prepare_interactive_graph_data(live_trace, query_history) if live_trace and query_history else None
 
-                assistant_message = {
+                # Display the final graph button
+                with graph_placeholder.container():
+                    if graph_data:
+                        if st.button("Launch Interactive Graph", key=f"graph_btn_live_{len(st.session_state.messages)}"):
+                            show_graph_dialog(graph_data)
+                    else:
+                        st.caption("Could not generate graph data.")
+
+                # Store the final, complete message in the session state
+                st.session_state.messages.append({
                     "role": "assistant",
-                    "content": response_data.get("final_answer", "Sorry, an error occurred.") + response_data.get("proactive_suggestions", ""),
-                    "sources": response_data.get("retrieved_sources", []),
-                    "reasoning": response_data.get("formatted_reasoning", "Trace not generated."),
+                    "content": full_response_content,
+                    "sources": sources,
+                    "reasoning": final_formatted_trace,
                     "graph_data": graph_data
-                }
-                st.session_state.messages.append(assistant_message)
-                st.session_state.messages[-2]["processed"] = True # Mark user message as processed
-                st.rerun()
+                })
+
+            except Exception as e:
+                logger.exception(f"An error occurred during query processing: {e}")
+                st.error(f"An error occurred: {e}")
 else:
-    st.warning("RAG system could not be initialized. The chatbot is offline.")
+    st.warning("RAG system is offline. Please check the logs.")
