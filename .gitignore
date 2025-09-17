@@ -65,3 +65,7 @@ ehthumbs.db
 api.txt
 RAG Model/multi-hop-reason/cnt_rag_graphs/*
 *.zip
+fine-tune/visualizations_S
+fine-tune/generated_training_data
+fine-tune/unstructured_output
+fine-tune/evaluation_outputs

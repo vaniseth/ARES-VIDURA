@@ -32,7 +32,7 @@ DEFAULT_OPENAI_EMBEDDING_MODEL = "text-embedding-ada-002" # or "text-embedding-3
 
 # --- Default Paths ---
 DEFAULT_VECTOR_DB_PATH = "vector_db_cnt.csv"
-DEFAULT_DOCUMENTS_PATH_PATTERN = "../../DataSets/TEST_SET/*" # "CNT_Papers/*" # Example: 
+DEFAULT_DOCUMENTS_PATH_PATTERN = "../../DataSets/TEST_SET_V2/*" # "CNT_Papers/*" # Example: 
 DEFAULT_LOG_FILE_PATH = "cnt_rag.log"
 DEFAULT_FEEDBACK_DB_PATH = "cnt_feedback_history.csv"
 DEFAULT_GRAPH_DIR = "cnt_rag_graphs"

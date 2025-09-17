@@ -396,40 +396,75 @@ class CNTRagSystem:
 
         return current_context_list, truly_new_chunks_list_of_dicts
 
+    # def _generate_final_answer(self, original_query: str, accumulated_context_list: List[str]) -> str:
+    #     """Generates the final answer, prompting the LLM to cite its sources."""
+    #     self.logger.info(f"Generating final answer for '{self.user_type}' user from accumulated context...")
+    #     final_context_str = "\n\n==== CONTEXT FROM HOP/SUMMARY SEPARATOR ====\n\n".join(accumulated_context_list)
+
+    #     if not final_context_str.strip() or final_context_str.strip() == "No relevant context found.":
+    #         self.logger.warning("No context available for final answer generation.")
+    #         return "Based on the retrieved information, a detailed analysis could not be performed due to insufficient context."
+
+    #     # This prompt is the same as before and works perfectly for this goal
+    #     prompt = f"""You are an expert researcher synthesizing a detailed technical analysis for an advanced colleague on Carbon Nanotubes (CNTs).
+
+    #     **Original Question:**
+    #     "{original_query}"
+
+    #     **Accumulated Context:**
+    #     Use ONLY the following context to answer the question. Each piece of context is preceded by its source information in the format [Source: Doc: '...', Page: ..., ChunkID: '...'].
+    #     --- START CONTEXT ---
+    #     {final_context_str}
+    #     --- END CONTEXT ---
+
+    #     **Your Task:**
+    #     1.  **Synthesize and Structure:** Write a comprehensive, well-structured answer to the "Original Question". Organize your answer into logical sections with clear, bolded headings (e.g., using Markdown like **Heading Title**). Explain concepts and their relationships.
+    #     2.  **Cite Everything:** You MUST cite every piece of information you use from the context. Place the citation at the end of the sentence or clause that uses the information.
+    #     3.  **Citation Format:** The citation format MUST BE: `(Source: Doc: '[Doc]', Page: [Page], ChunkID: '[ChunkID]')`.
+    #     4.  **Strictly Adhere to Context:** Base your entire answer ONLY on the "Accumulated Context".
+    #     5.  **Identify Gaps:** After providing the main answer, add a final section titled "**Missing Information**". In this section, describe what specific technical details are needed but are not present in the provided context.
+
+    #     ---
+    #     **Final Synthesized Answer (Detailed, Structured, and with In-Text Citations):**
+    #     """
+        
+    #     final_response = self.llm_interface.generate_response(prompt)
+
+    #     if final_response.startswith("LLM_ERROR"):
+    #          self.logger.error(f"Final answer generation failed: {final_response}")
+    #          return f"I encountered an error while trying to generate the final answer ({final_response})."
+    #     else:
+    #          self.logger.info(f"Final answer generated (length: {len(final_response)}).")
+    #          final_response = re.sub(r"^\s*Final Synthesized Answer:?.*?\s*", "", final_response, flags=re.IGNORECASE | re.DOTALL).strip()
+    #          return final_response
+         
     def _generate_final_answer(self, original_query: str, accumulated_context_list: List[str]) -> str:
-        """Generates the final answer, prompting the LLM to cite its sources."""
-        self.logger.info(f"Generating final answer for '{self.user_type}' user from accumulated context...")
-        final_context_str = "\n\n==== CONTEXT FROM HOP/SUMMARY SEPARATOR ====\n\n".join(accumulated_context_list)
-
-        if not final_context_str.strip() or final_context_str.strip() == "No relevant context found.":
-            self.logger.warning("No context available for final answer generation.")
-            return "Based on the retrieved information, a detailed analysis could not be performed due to insufficient context."
-
-        # This prompt is the same as before and works perfectly for this goal
-        prompt = f"""You are an expert researcher synthesizing a detailed technical analysis for an advanced colleague on Carbon Nanotubes (CNTs).
-
-        **Original Question:**
-        "{original_query}"
-
-        **Accumulated Context:**
-        Use ONLY the following context to answer the question. Each piece of context is preceded by its source information in the format [Source: Doc: '...', Page: ..., ChunkID: '...'].
-        --- START CONTEXT ---
-        {final_context_str}
-        --- END CONTEXT ---
-
-        **Your Task:**
-        1.  **Synthesize and Structure:** Write a comprehensive, well-structured answer to the "Original Question". Organize your answer into logical sections with clear, bolded headings (e.g., using Markdown like **Heading Title**). Explain concepts and their relationships.
-        2.  **Cite Everything:** You MUST cite every piece of information you use from the context. Place the citation at the end of the sentence or clause that uses the information.
-        3.  **Citation Format:** The citation format MUST BE: `(Source: Doc: '[Doc]', Page: [Page], ChunkID: '[ChunkID]')`.
-        4.  **Strictly Adhere to Context:** Base your entire answer ONLY on the "Accumulated Context".
-        5.  **Identify Gaps:** After providing the main answer, add a final section titled "**Missing Information**". In this section, describe what specific technical details are needed but are not present in the provided context.
-
-        ---
-        **Final Synthesized Answer (Detailed, Structured, and with In-Text Citations):**
         """
+        Generates the final, synthesized answer based on the query and all retrieved context.
+        """
+        if not accumulated_context_list:
+            return "Based on the provided documents, I cannot answer this question."
+
+        full_context = "\\n\\n---\\n\\n".join(accumulated_context_list)
+        
+        # This new prompt encourages detailed, expert-style answers.
+        prompt = f"""You are a highly knowledgeable CNC machine expert and technical writer. Your task is to provide a comprehensive, clear, and well-structured answer to the user's question based ONLY on the provided technical context.
+
+        Instructions:
+        1.  Synthesize the information from the context into a thorough and explanatory answer. Do not just list facts; explain the concepts, steps, and reasoning.
+        2.  Structure your answer logically. Use paragraphs to explain complex topics. If describing a process, outline the steps clearly.
+        3.  Adopt the tone of an expert providing a detailed explanation in a user manual. The answer should be instructive and complete.
+        4.  Ensure the answer is self-contained and directly addresses the user's question with the depth seen in the ground truth examples.
+        5.  Crucially, do NOT mention the context, the documents, or that you are an AI. Do not use conversational filler.
+
+        User's Query: {original_query}
+
+        Context:
+        {full_context}
+
+        Answer:"""
         
         final_response = self.llm_interface.generate_response(prompt)
-
         if final_response.startswith("LLM_ERROR"):
              self.logger.error(f"Final answer generation failed: {final_response}")
              return f"I encountered an error while trying to generate the final answer ({final_response})."
