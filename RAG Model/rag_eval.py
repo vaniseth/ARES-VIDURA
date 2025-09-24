@@ -205,9 +205,9 @@ if __name__ == "__main__":
 
         print("\n--- Aggregated Evaluation Scores (Reference Answer vs CLEANED LLM Answer) ---")
         print(f"Average BLEU Score:           {avg_bleu:.4f} {format_score_list(bleu_scores_list)}")
-        print(f"Average ROUGE-1 F1 Score:   {avg_rouge1:.4f} {format_score_list(rouge1_scores_list)}")
-        print(f"Average ROUGE-2 F1 Score:   {avg_rouge2:.4f} {format_score_list(rouge2_scores_list)}")
-        print(f"Average ROUGE-L F1 Score:   {avg_rougeL:.4f} {format_score_list(rougeL_scores_list)}")
+        print(f"Average ROUGE-1 Score:   {avg_rouge1:.4f} {format_score_list(rouge1_scores_list)}")
+        print(f"Average ROUGE-2 Score:   {avg_rouge2:.4f} {format_score_list(rouge2_scores_list)}")
+        print(f"Average ROUGE-L Score:   {avg_rougeL:.4f} {format_score_list(rougeL_scores_list)}")
         print(f"Average Cosine Similarity:  {avg_cosine:.4f} {format_score_list(cosine_scores_list)}")
     else:
         print("\nNo scores were available to calculate aggregated results.")
