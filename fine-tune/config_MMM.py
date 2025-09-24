@@ -31,6 +31,7 @@ S2_TAG = f"{S1_TAG}_self-improve_{s2_train_tag}_v2"
 # --- FILE PATHS AND DIRECTORIES (DO NOT EDIT) ---
 # ======================================================================================
 PDF_FOLDER_PATH = "../DataSets/"
+<<<<<<< HEAD
 
 # --- THIS IS THE CORRECTED TWO-DIRECTORY SETUP ---
 # Use a large, temporary scratch space on the cluster for training checkpoints
@@ -41,6 +42,9 @@ SCRATCH_DIR = f"/tmp/{os.getenv('USER', 'user')}/cnt_finetuning"
 LOCAL_MODEL_SAVE_DIR = "trained_models" 
 # --- END OF CORRECTION ---
 
+=======
+SCRATCH_DIR = f"/tmp/{os.getenv('USER', 'user')}/cnt_finetuning"
+>>>>>>> a74b644835d46650b0ab91769ffcb607430a46c9
 CACHE_DIR_UNSTRUCTURED = "unstructured_output" # <-- ADD THIS LINE
 OUTPUT_DIR_VISUALIZATIONS = "visualizations"
 OUTPUT_DIR_EVALUATION = "evaluation_outputs"
@@ -67,10 +71,17 @@ DATASET_JUDGE_RESULTS_PATH = os.path.join(OUTPUT_DIR_EVALUATION, f"dataset_judge
 # --- HYPERPARAMETERS & CONFIGS ---
 # ======================================================================================
 # Data Generation
+<<<<<<< HEAD
 NUM_SAMPLES_TO_GENERATE_CHUNKS = 360
 NUM_SAMPLES_TO_GENERATE_DEEP = 140
 CHUNK_SIZES = [1024, 768, 512]
 DEEP_CHUNK_SIZE = 1024
+=======
+NUM_SAMPLES_TO_GENERATE_CHUNKS = 10
+NUM_SAMPLES_TO_GENERATE_DEEP = 5
+CHUNK_SIZES = [1024, 2048]
+DEEP_CHUNK_SIZE = 4096
+>>>>>>> a74b644835d46650b0ab91769ffcb607430a46c9
 
 # Training
 MAX_TRAINING_STEPS = 300
@@ -88,6 +99,7 @@ BNB_CONFIG = transformers.BitsAndBytesConfig(
     bnb_4bit_quant_type="nf4", bnb_4bit_compute_dtype=torch.bfloat16
 )
 
+<<<<<<< HEAD
 # Chat Templates
 LLAMA2_CHAT_TEMPLATE = ("{% for message in messages %}{% if message['role'] == 'user' %}<s>[INST] {{ message['content'] }} [/INST]{% elif message['role'] == 'assistant' %} {{ message['content'] }}</s>{% endif %}{% endfor %}")
 MISTRAL_CHAT_TEMPLATE = ("{% for message in messages %}{% if message['role'] == 'user' %}<s>[INST] {{ message['content'] }} [/INST]{% elif message['role'] == 'assistant' %}{{ message['content'] }}</s>{% endif %}{% endfor %}")
@@ -95,3 +107,10 @@ CHAT_TEMPLATES = {
     "quokka": LLAMA2_CHAT_TEMPLATE,
     "mistral": MISTRAL_CHAT_TEMPLATE,
 }
+=======
+# Chat Templates (no changes here)
+MISTRAL_CHAT_TEMPLATE = (
+    "<s>[INST] {user_content} [/INST] {assistant_content} </s>"
+)
+CHAT_TEMPLATES = {"mistral": MISTRAL_CHAT_TEMPLATE}
+>>>>>>> a74b644835d46650b0ab91769ffcb607430a46c9

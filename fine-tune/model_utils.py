@@ -50,6 +50,7 @@ def generate_response(model, tokenizer, prompt, max_new_tokens=1024):
     """Generates a response from a loaded model."""
     chat = [{"role": "user", "content": prompt}]
     text = tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=True)
+<<<<<<< HEAD
     
     # --- NEW: Safety logic for max_length ---
     # Define a practical upper limit for generation context length
@@ -70,6 +71,13 @@ def generate_response(model, tokenizer, prompt, max_new_tokens=1024):
         return_tensors="pt",
         truncation=True,
         max_length=effective_max_length # MODIFIED: Use the new safe value
+=======
+    inputs = tokenizer(
+        text, 
+        return_tensors="pt",
+        truncation=True, # <-- Add this line
+        max_length=tokenizer.model_max_length # <-- Add this line to respect the model's limit
+>>>>>>> a74b644835d46650b0ab91769ffcb607430a46c9
     ).to('cuda')
     
     generated_ids = model.generate(
