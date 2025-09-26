@@ -91,11 +91,6 @@ def _format_rag_prompt(original_query, context_str):
 
 
 # --- 2. TRADITIONAL (QUANTITATIVE) EVALUATION ---
-<<<<<<< HEAD
-=======
-
-# --- MODIFIED: Added 'experiment_name' to pass down to plotting functions ---
->>>>>>> a74b644835d46650b0ab91769ffcb607430a46c9
 def run_traditional_evaluation(config, model_v1, model_v2, tokenizer, experiment_name):
     print("\n--- Running Traditional Quantitative Evaluation (ROUGE, Cosine Sim) ---")
     if not os.path.exists(config.EVALUATION_DATA_PATH):
@@ -105,7 +100,6 @@ def run_traditional_evaluation(config, model_v1, model_v2, tokenizer, experiment
     with open(config.EVALUATION_DATA_PATH, 'r', encoding='utf-8') as f:
         eval_data = json.load(f)
         
-<<<<<<< HEAD
     # --- NEW: Add a random question from the V2 generated dataset ---
     print("  -> Augmenting evaluation set with one random sample from generated data...")
     v2_dataset_path = config.DATASET_V2_COMBINED_PATH
@@ -129,8 +123,6 @@ def run_traditional_evaluation(config, model_v1, model_v2, tokenizer, experiment
         print(f"  -> Warning: V2 dataset not found at {v2_dataset_path}. Cannot add random question.")
     # --- END NEW LOGIC ---
         
-=======
->>>>>>> a74b644835d46650b0ab91769ffcb607430a46c9
     rouge = evaluate.load('rouge')
     similarity_model = SentenceTransformer('all-MiniLM-L6-v2', device='cuda')
     
@@ -143,24 +135,15 @@ def run_traditional_evaluation(config, model_v1, model_v2, tokenizer, experiment
         v1_response = generate_response(model_v1, tokenizer, prompt)
         v2_response = generate_response(model_v2, tokenizer, prompt)
 
-<<<<<<< HEAD
         with open(os.path.join(config.OUTPUT_DIR_EVALUATION, f"q{i+1}_{experiment_name}_model_v1_response.txt"), "w", encoding='utf-8') as f: f.write(v1_response)
         with open(os.path.join(config.OUTPUT_DIR_EVALUATION, f"q{i+1}_{experiment_name}_model_v2_response.txt"), "w", encoding='utf-8') as f: f.write(v2_response)
 
         # ROUGE
-=======
-        with open(os.path.join(config.OUTPUT_DIR_EVALUATION, f"q{i+1}_{experiment_name}_model_v1_response.txt"), "w") as f: f.write(v1_response)
-        with open(os.path.join(config.OUTPUT_DIR_EVALUATION, f"q{i+1}_{experiment_name}_model_v2_response.txt"), "w") as f: f.write(v2_response)
-
->>>>>>> a74b644835d46650b0ab91769ffcb607430a46c9
         score_rag = rouge.compute(predictions=[rag_response], references=[ground_truth])
         score_v1 = rouge.compute(predictions=[v1_response], references=[ground_truth])
         score_v2 = rouge.compute(predictions=[v2_response], references=[ground_truth])
         
-<<<<<<< HEAD
         # Cosine Similarity
-=======
->>>>>>> a74b644835d46650b0ab91769ffcb607430a46c9
         embeddings = similarity_model.encode([ground_truth, rag_response, v1_response, v2_response])
         cos_sim_rag = util.cos_sim(embeddings[0], embeddings[1]).item()
         cos_sim_v1 = util.cos_sim(embeddings[0], embeddings[2]).item()
@@ -177,22 +160,11 @@ def run_traditional_evaluation(config, model_v1, model_v2, tokenizer, experiment
         })
 
     df = pd.DataFrame(results)
-<<<<<<< HEAD
     _plot_score_comparison(df, config.OUTPUT_DIR_VISUALIZATIONS, experiment_name)
-=======
-    # MODIFIED: Pass the experiment_name to the plotting function
-    _plot_score_comparison(df, config.OUTPUT_DIR_VISUALIZATIONS, experiment_name)
-    
-    # MODIFIED: Make the HTML report filename unique
->>>>>>> a74b644835d46650b0ab91769ffcb607430a46c9
     report_path = os.path.join(config.OUTPUT_DIR_VISUALIZATIONS, f'quantitative_report_{experiment_name}.html')
     df.to_html(report_path, escape=False)
     print(f"Quantitative evaluation complete. Report and graph saved in '{config.OUTPUT_DIR_VISUALIZATIONS}/'.")
 
-<<<<<<< HEAD
-=======
-# ... (The rest of the file, LLM Judge and Dataset Eval, is unchanged but included for completeness) ...
->>>>>>> a74b644835d46650b0ab91769ffcb607430a46c9
 # --- 3. LLM-AS-A-JUDGE (QUALITATIVE) EVALUATION ---
 def _get_llm_judge_prompt(question, response_v1, response_v2):
     return f"""You are a meticulous and impartial evaluator for a scientific research context, specifically Carbon Nanotubes (CNTs). Your task is to compare two responses to a given question.
